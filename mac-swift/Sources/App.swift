@@ -42,24 +42,23 @@ final class Model: ObservableObject {
     func start(links: String, audio: Bool, height: String, folder: String, playlist: Bool) {
         guard !busy else { return }
         guard let base = ytdlp else { addLog("yt-dlp was not found."); return }
-        let raw = links.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        var urls = raw.filter(validURL)
-        let bad = raw.filter { !validURL($0) }
-        if !bad.isEmpty { addLog("Skipped (not an http/https link): " + bad.map { String($0.prefix(60)) }.joined(separator: ", ")) }
-        if urls.isEmpty { addLog("Paste at least one link that starts with http:// or https://"); return }
-        if urls.count > maxLinks { addLog("Only the first \(maxLinks) links are used."); urls = Array(urls.prefix(maxLinks)) }
+        let lines = links.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if lines.isEmpty { addLog("Paste at least one link (a website link or a Spotify song, album or playlist link)."); return }
         let chosen = folder.trimmingCharacters(in: .whitespaces).isEmpty ? defaultFolder : folder
         let dir = (chosen as NSString).expandingTildeInPath
         do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) } catch {
             addLog("Cannot use that folder: \(error.localizedDescription)"); return
         }
-        rows = urls.enumerated().map { Row(id: $0.offset, url: $0.element, status: "Waiting", file: nil) }
+        rows = []
         progress = 0
-        speedText = ""
+        speedText = lines.contains(where: { parseSpotifyLink($0) != nil }) ? "Reading Spotify..." : ""
         busy = true
         let (js, ffmpeg) = (self.js, self.ffmpeg)
         DispatchQueue.global(qos: .userInitiated).async { [runner] in
-            runner.run(base: base, urls: urls, audio: audio, height: height, folder: dir, playlist: playlist, js: js, ffmpeg: ffmpeg) { ev in
+            let jobs = planJobs(lines: lines, baseFolder: dir) { text in DispatchQueue.main.async { self.addLog(text) } }
+            DispatchQueue.main.async { self.apply(.plan(jobs.map { $0.label })) }
+            if jobs.isEmpty { DispatchQueue.main.async { self.apply(.finished) }; return }
+            runner.run(base: base, jobs: jobs, audio: audio, height: height, playlist: playlist, js: js, ffmpeg: ffmpeg) { ev in
                 DispatchQueue.main.async { self.apply(ev) }
             }
         }
@@ -67,9 +66,12 @@ final class Model: ObservableObject {
 
     private func apply(_ ev: JobEvent) {
         switch ev {
+        case .plan(let labels):
+            rows = labels.enumerated().map { Row(id: $0.offset, url: $0.element, status: "Waiting", file: nil) }
+            speedText = ""
         case .row(let i, let status):
             if rows.indices.contains(i) { rows[i].status = status }
-            if status == "Done" { progress = 100; speedText = "" }
+            if status.hasPrefix("Done") { progress = 100; speedText = "" }
             if status == "Failed" || status == "Cancelled" { progress = 0; speedText = "" }
         case .progress(let i, let pct, let speed, let eta):
             progress = pct
@@ -98,6 +100,7 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Links (one per line)").font(.headline)
+            Text("Website links, or a Spotify song, album or playlist link (each song is searched on YouTube).").font(.footnote).foregroundColor(.secondary)
             HStack(alignment: .top) {
                 TextEditor(text: $links)
                     .font(.system(.body, design: .monospaced))
@@ -154,7 +157,7 @@ struct ContentView: View {
                 HStack {
                     Text(row.url).lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Text(row.status).foregroundColor(color(for: row.status)).frame(width: 110, alignment: .leading)
+                    Text(row.status).foregroundColor(color(for: row.status)).frame(width: 150, alignment: .leading)
                 }
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) {
@@ -183,7 +186,7 @@ struct ContentView: View {
 
     private func color(for status: String) -> Color {
         switch status {
-        case "Done": return .green
+        case _ where status.hasPrefix("Done"): return status == "Done" ? .green : .orange
         case "Failed": return .red
         default: return .secondary
         }
