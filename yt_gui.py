@@ -492,6 +492,20 @@ def itunes_album_hits(j):
     return out
 
 
+def relevant_artists(hits, query):
+    """Apple returns loose matches; keep only artists whose name has every searched word in it, unless that leaves nothing."""
+    import unicodedata
+
+    def words(t):
+        t = ''.join(c for c in unicodedata.normalize('NFKD', t) if not unicodedata.combining(c))
+        return re.findall(r'\w+', t.lower())
+    q = words(query)
+    if not q:
+        return hits
+    keep = [h for h in hits if all(any(n.startswith(w) for n in words(h['title'])) for w in q)]
+    return keep or hits
+
+
 def itunes_artist_hits(j):
     return [new_hit('itunes:artist:%d' % r['artistId'], r['artistName'], '', r.get('primaryGenreName') or '')
             for r in j.get('results') or [] if r.get('artistId') and r.get('artistName')]
@@ -549,7 +563,7 @@ def search_catalog(kind, query):
     if kind == 'playlist':
         j = deezer_json('https://api.deezer.com/search/playlist?q=%s&limit=30' % q)
         return (deezer_playlist_hits(j), '') if j is not None else ([], CATALOG_DOWN['deezer'])
-    entity, limit, fn = {'song': ('song', 30, itunes_song_hits), 'album': ('album', 30, itunes_album_hits)}.get(kind, ('musicArtist', 15, itunes_artist_hits))
+    entity, limit, fn = {'song': ('song', 30, itunes_song_hits), 'album': ('album', 30, itunes_album_hits)}.get(kind, ('musicArtist', 15, lambda j: relevant_artists(itunes_artist_hits(j), query)))
     j = itunes_json('https://itunes.apple.com/search?term=%s&entity=%s&limit=%d' % (q, entity, limit))
     return (fn(j), '') if j is not None else ([], CATALOG_DOWN['itunes'])
 
@@ -1389,6 +1403,12 @@ def selftest():
     dt = deezer_track({'title': 'Dance', 'duration': 200, 'artist': {'name': 'Band'}, 'album': {'title': 'LP', 'cover_xl': 'https://x/xl.jpg'}})
     eq((dt['duration_ms'], dt['album'], dt['art_url']), (200000, 'LP', 'https://x/xl.jpg'), 'deezer track')
     eq(itunes_artist_hits({'results': [{'artistId': 9, 'artistName': 'ישי ריבו', 'primaryGenreName': 'Pop'}]})[0]['id'], 'itunes:artist:9', 'artist hit')
+    arts = [new_hit('a', 'The Miami Boys Choir'), new_hit('b', 'Al Green'), new_hit('c', 'Yerachmiel Begun & the Miami Boys Choir')]
+    eq([h['id'] for h in relevant_artists(arts, 'miami boys choir')], ['a', 'c'], 'unrelated artists dropped')
+    eq([h['id'] for h in relevant_artists(arts, 'Beyoncé')], ['a', 'b', 'c'], 'nothing matches: keep all rather than show nothing')
+    eq([h['id'] for h in relevant_artists([new_hit('x', 'Beyoncé')], 'beyonce')], ['x'], 'accents ignored')
+    eq([h['id'] for h in relevant_artists([new_hit('h', 'ישי ריבו')], 'ישי')], ['h'], 'Hebrew words match')
+    eq([h['id'] for h in relevant_artists(arts, 'mia')], ['a', 'c'], 'partial words match word starts')
     # catalog lines flow through the planner (with the network faked)
     real_fc = fetch_catalog
     alb = {'name': 'Abbey Road', 'collection': True, 'tracks': [new_track('A', 'B', 1000, album='Abbey Road', number=1, total=3), new_track('C', 'B', 2000, album='Abbey Road', number=2, total=3), new_track('D', 'B', 3000, album='Abbey Road', number=3, total=3)]}

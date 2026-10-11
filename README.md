@@ -11,9 +11,19 @@ A small window for downloading video or audio with [yt-dlp](https://github.com/y
 - **Audio quality:** choose "m4a" (plays everywhere) or "best available" (often .webm/opus). YouTube audio tops out around 128-160 kbps either way. **Video quality:** choose a max height; without ffmpeg, YouTube video is limited to the single-file formats it still offers (up to 360p).
 
 ## Mac (native Swift app)
-`cd mac-swift && ./build.sh` builds a universal `build/yt-dlp GUI.app` (needs Xcode or the Command Line Tools). Copy it to Applications. No Python needed. It looks for `yt-dlp` on your PATH, in `~/Applications`, and in Downloads; or press "Locate yt-dlp...".
-Logic check without a window: `"build/yt-dlp GUI.app/Contents/MacOS/yt-dlp-gui" --selftest`
+`cd mac-swift && ./build.sh` builds a universal `build.noindex/yt-dlp GUI.app` (the `.noindex` folder keeps Spotlight from listing a second copy) (needs Xcode or the Command Line Tools). Copy it to Applications. No Python needed. It looks for `yt-dlp` on your PATH, in `~/Applications`, and in Downloads; or press "Locate yt-dlp...".
+Logic check without a window: `"build.noindex/yt-dlp GUI.app/Contents/MacOS/yt-dlp-gui" --selftest`
 
 ## Windows (Python)
 Install Python from python.org, then double-click `Start yt-dlp GUI.bat` (runs `yt_gui.py`, standard library only). The same file runs on a Mac with python.org Python, but Apple's built-in Python has an old Tk that shows a blank window on recent macOS, which is why the Mac app is native.
 Logic check: `python3 yt_gui.py --selftest`
+
+## Debug driver (Mac app)
+For testing without anything appearing on screen. Launch with `YTGUI_DEBUG_DRIVER=<scratch dir>`: the app runs with no Dock icon and fully transparent, click-through windows, writes `status.txt` (settings, link box, download rows, Search and song-picker state, logs) and `snapshot.png` (its own rendering; `snapshot_sheet.png` while a Search or song-picker sheet is open) about twice a second, and runs commands written one per line to `command.txt`. All in-process, so no Accessibility or Screen Recording permission. Inert unless the variable is set.
+
+```bash
+D=/some/scratch/dir; mkdir -p "$D"
+open -g -n --env YTGUI_DEBUG_DRIVER="$D" "build.noindex/yt-dlp GUI.app"      # -g: don't steal focus; -n: separate instance
+printf 'mode audio\nlinks itunes:album:1441164426 # Abbey Road\ndownload\nwaitpicker\npicktoggle 0\npickok\nwaitidle\nshot\n' > "$D/command.txt"
+```
+Commands: `links <text, \n for a new line>`, `addlink`, `mode video|audio`, `height`, `audioformat m4a|best`, `playlist on|off`, `asksongs on|off`, `folder`, `download`, `cancel`, `waitidle`, `wait <s>`, `search`, `closesearch`, `searchkind song|album|artist|playlist`, `query`, `dosearch`, `waitsearch`, `searchselect <i,j|all|none>`, `showalbums <i>`, `searchback`, `searchadd`, `waitpicker`, `pickall`, `picknone`, `picktoggle <i>`, `pickok`, `pickskip`, `size <w> <h>`, `shot`, `quit`. Use a new scratch folder per launch and `quit` (or `pkill -f "build.noindex/yt-dlp GUI.app"`) before relaunching after a rebuild.

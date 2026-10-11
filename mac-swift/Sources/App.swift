@@ -8,14 +8,24 @@ struct Row: Identifiable {
     var file: String?
 }
 
-struct PickerRequest: Identifiable {
+/// The song list shown when an album or playlist is about to be downloaded.
+final class PickerState: ObservableObject, Identifiable {
     let id = UUID()
     let name: String
     let tracks: [Track]
+    @Published var selected: Set<Int>
+    init(name: String, tracks: [Track]) {
+        self.name = name
+        self.tracks = tracks
+        self.selected = Set(tracks.indices)
+    }
 }
 
+/// Everything the window shows lives here (not inside the views), so the debug driver can read and change it too.
 final class Model: ObservableObject {
-    @Published var picker: PickerRequest?
+    @Published var links = ""
+    @Published var showSearch = false
+    @Published var picker: PickerState?
     private var pickerResult: (([Int]?) -> Void)?
 
     @Published var rows: [Row] = []
@@ -27,11 +37,15 @@ final class Model: ObservableObject {
     @Published var hasJS = false
     @Published var hasFFmpeg = false
 
+    let search = SearchModel()
     private let runner = Runner()
     private var js: (String, String)?
     private var ffmpeg: String?
 
-    init() { refreshTools(saved: UserDefaults.standard.string(forKey: "ytdlpPath")) }
+    init() {
+        refreshTools(saved: UserDefaults.standard.string(forKey: "ytdlpPath"))
+        search.addLines = { [unowned self] lines in self.addLinks(lines) }
+    }
 
     func refreshTools(saved: String?) {
         ytdlp = findYtDlp(saved: saved)
@@ -44,13 +58,17 @@ final class Model: ObservableObject {
         }
     }
 
+    func addLinks(_ lines: [String]) {
+        links += (links.isEmpty || links.hasSuffix("\n") ? "" : "\n") + lines.joined(separator: "\n") + "\n"
+    }
+
     /// Called from the background thread: shows the song list and waits until the user is done.
     func chooseSongs(_ list: SpotifyList) -> [Int]? {
         let sem = DispatchSemaphore(value: 0)
         var result: [Int]?
         DispatchQueue.main.async {
             self.pickerResult = { sel in result = sel; sem.signal() }
-            self.picker = PickerRequest(name: list.name, tracks: list.tracks)
+            self.picker = PickerState(name: list.name, tracks: list.tracks)
         }
         sem.wait()
         return result
@@ -67,11 +85,23 @@ final class Model: ObservableObject {
 
     func cancel() { runner.cancel() }
 
+    /// Starts downloading what is in the link box, using the saved settings.
+    func startDownload() {
+        let d = UserDefaults.standard
+        let audio = (d.string(forKey: "mode") ?? "video") == "audio"
+        let height = d.string(forKey: "height") ?? "720"
+        let audioFormat = d.string(forKey: "audioFormat") ?? "m4a"
+        let playlist = (d.object(forKey: "playlist") as? Bool) ?? false
+        let askSongs = (d.object(forKey: "askSongs") as? Bool) ?? true
+        let folder = d.string(forKey: "folder") ?? defaultFolder
+        start(links: links, audio: audio, height: height, folder: folder, playlist: playlist, audioFormat: audioFormat, askSongs: askSongs)
+    }
+
     func start(links: String, audio: Bool, height: String, folder: String, playlist: Bool, audioFormat: String, askSongs: Bool) {
         guard !busy else { return }
         guard let base = ytdlp else { addLog("yt-dlp was not found."); return }
         let lines = links.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        if lines.isEmpty { addLog("Paste at least one link (a website link or a Spotify song, album or playlist link)."); return }
+        if lines.isEmpty { addLog("Paste at least one link (a website link, a Spotify link, or a search result)."); return }
         let chosen = folder.trimmingCharacters(in: .whitespaces).isEmpty ? defaultFolder : folder
         let dir = (chosen as NSString).expandingTildeInPath
         do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) } catch {
@@ -79,7 +109,7 @@ final class Model: ObservableObject {
         }
         rows = []
         progress = 0
-        speedText = lines.contains(where: { parseSpotifyLink($0) != nil }) ? "Reading Spotify..." : ""
+        speedText = lines.contains(where: { parseSpotifyLink($0) != nil || parseCatalogLine($0) != nil }) ? "Looking up songs..." : ""
         busy = true
         let (js, ffmpeg) = (self.js, self.ffmpeg)
         DispatchQueue.global(qos: .userInitiated).async { [runner] in
@@ -116,10 +146,10 @@ final class Model: ObservableObject {
     }
 }
 
+let appModel = Model()
+
 struct ContentView: View {
-    @StateObject private var model = Model()
-    @State private var links = ""
-    @State private var showSearch = false
+    @ObservedObject private var model = appModel
     @AppStorage("mode") private var mode = "video"
     @AppStorage("height") private var height = "720"
     @AppStorage("audioFormat") private var audioFormat = "m4a"
@@ -132,27 +162,27 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Links (one per line)").font(.headline)
-            Text("Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.").font(.footnote).foregroundColor(.secondary)
+            Text("Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.")
+                .font(.footnote).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top) {
-                TextEditor(text: $links)
+                TextEditor(text: $model.links)
                     .font(.system(.body, design: .monospaced))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.4)))
                 VStack {
                     Button("Paste") {
                         if let s = NSPasteboard.general.string(forType: .string) {
-                            links += (links.isEmpty || links.hasSuffix("\n") ? "" : "\n") + s.trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+                            model.addLinks([s.trimmingCharacters(in: .whitespacesAndNewlines)])
                         }
                     }
-                    Button("Search...") { showSearch = true }
+                    Button("Search...") { model.showSearch = true }
                 }
-                .sheet(isPresented: $showSearch) {
-                    SearchSheet(add: { lines in
-                        links += (links.isEmpty || links.hasSuffix("\n") ? "" : "\n") + lines.joined(separator: "\n") + "\n"
-                    }, close: { showSearch = false })
+                .sheet(isPresented: $model.showSearch) {
+                    SearchSheet(m: model.search, close: { model.showSearch = false })
                 }
             }
 
+            // two short rows, so nothing is ever wider than the window
             HStack(spacing: 14) {
                 Picker("", selection: $mode) {
                     Text("Video").tag("video")
@@ -161,20 +191,24 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 190)
                 .labelsHidden()
-                Picker("Max height", selection: $height) {
-                    ForEach(heights, id: \.self) { Text($0 == "best" ? "Best" : "\($0)p").tag($0) }
+                if audio {
+                    Picker("Audio", selection: $audioFormat) {
+                        Text("m4a (plays everywhere)").tag("m4a")
+                        Text("Best available").tag("best")
+                    }
+                    .frame(width: 270)
+                } else {
+                    Picker("Max height", selection: $height) {
+                        ForEach(heights, id: \.self) { Text($0 == "best" ? "Best" : "\($0)p").tag($0) }
+                    }
+                    .frame(width: 190)
                 }
-                .frame(width: 170)
-                .disabled(audio)
-                Picker("Audio", selection: $audioFormat) {
-                    Text("m4a (plays everywhere)").tag("m4a")
-                    Text("Best available").tag("best")
-                }
-                .frame(width: 250)
-                .disabled(!audio)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 18) {
                 Toggle("Whole playlist", isOn: $playlist)
-                Toggle("Choose songs", isOn: $askSongs)
-                Spacer()
+                Toggle("Choose songs from albums and playlists", isOn: $askSongs)
+                Spacer(minLength: 0)
             }
 
             Text(hint).font(.footnote).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -191,7 +225,7 @@ struct ContentView: View {
             }
 
             HStack {
-                Button("Download") { model.start(links: links, audio: audio, height: height, folder: folder, playlist: playlist, audioFormat: audioFormat, askSongs: askSongs) }
+                Button("Download") { model.startDownload() }
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(model.busy)
                 Button("Cancel") { model.cancel() }.disabled(!model.busy)
@@ -204,7 +238,7 @@ struct ContentView: View {
                 HStack {
                     Text(row.url).lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Text(row.status).foregroundColor(color(for: row.status)).frame(width: 150, alignment: .leading)
+                    Text(row.status).foregroundColor(color(for: row.status)).frame(width: 150, alignment: .leading).lineLimit(1)
                 }
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) {
@@ -222,9 +256,9 @@ struct ContentView: View {
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.4)))
         }
         .padding(16)
-        .frame(minWidth: 640, minHeight: 600)
-        .sheet(item: $model.picker, onDismiss: { model.finishPicker(nil) }) { req in
-            SongPicker(request: req) { model.finishPicker($0) }
+        .frame(minWidth: 620, maxWidth: .infinity, minHeight: 600)
+        .sheet(item: $model.picker, onDismiss: { model.finishPicker(nil) }) { p in
+            SongPicker(state: p) { model.finishPicker($0) }
         }
     }
 
@@ -264,30 +298,23 @@ struct ContentView: View {
 }
 
 struct SongPicker: View {
-    let request: PickerRequest
+    @ObservedObject var state: PickerState
     let finish: ([Int]?) -> Void
-    @State private var selected: Set<Int>
-
-    init(request: PickerRequest, finish: @escaping ([Int]?) -> Void) {
-        self.request = request
-        self.finish = finish
-        _selected = State(initialValue: Set(request.tracks.indices))
-    }
 
     private func length(_ ms: Int) -> String { ms > 0 ? String(format: "%d:%02d", ms / 60000, (ms / 1000) % 60) : "" }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(request.name).font(.headline)
+            Text(state.name).font(.headline)
             Text("Pick the songs to download.").font(.footnote).foregroundColor(.secondary)
             HStack {
-                Button("Select all") { selected = Set(request.tracks.indices) }
-                Button("Select none") { selected = [] }
+                Button("Select all") { state.selected = Set(state.tracks.indices) }
+                Button("Select none") { state.selected = [] }
                 Spacer()
-                Text("\(selected.count) of \(request.tracks.count) selected").foregroundColor(.secondary)
+                Text("\(state.selected.count) of \(state.tracks.count) selected").foregroundColor(.secondary)
             }
-            List(Array(request.tracks.enumerated()), id: \.offset) { i, t in
-                Toggle(isOn: Binding(get: { selected.contains(i) }, set: { on in if on { selected.insert(i) } else { selected.remove(i) } })) {
+            List(Array(state.tracks.enumerated()), id: \.offset) { i, t in
+                Toggle(isOn: Binding(get: { state.selected.contains(i) }, set: { on in if on { state.selected.insert(i) } else { state.selected.remove(i) } })) {
                     HStack {
                         Text("\(i + 1).").foregroundColor(.secondary).frame(width: 34, alignment: .trailing)
                         Text(trackLabel(t)).lineLimit(1).truncationMode(.tail)
@@ -300,9 +327,9 @@ struct SongPicker: View {
             HStack {
                 Button("Skip this one") { finish([]) }
                 Spacer()
-                Button("Download \(selected.count) song\(selected.count == 1 ? "" : "s")") { finish(Array(selected)) }
+                Button("Download \(state.selected.count) song\(state.selected.count == 1 ? "" : "s")") { finish(Array(state.selected)) }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(selected.isEmpty)
+                    .disabled(state.selected.isEmpty)
             }
         }
         .padding(16)
@@ -310,7 +337,20 @@ struct SongPicker: View {
     }
 }
 
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        if debugDriverRequested { NSApp.setActivationPolicy(.accessory) }   // no Dock icon, no menu bar takeover
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DebugDriver.startIfRequested()
+    }
+}
+
 struct YtDlpGUIApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+
     var body: some Scene {
         WindowGroup("yt-dlp GUI") { ContentView() }
             .defaultSize(width: 680, height: 640)

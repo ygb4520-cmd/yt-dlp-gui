@@ -84,6 +84,22 @@ func itunesAlbumHits(_ json: [String: Any]) -> [SearchHit] {
     }
 }
 
+/// Apple returns loose matches (a search for one choir also lists unrelated stars); keep only artists whose name
+/// has every searched word in it, unless that would leave nothing.
+func relevantArtists(_ hits: [SearchHit], query: String) -> [SearchHit] {
+    func words(_ s: String) -> [String] {
+        s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+    }
+    let q = words(query)
+    guard !q.isEmpty else { return hits }
+    let matches = hits.filter { h in
+        let name = words(h.title)
+        return q.allSatisfy { w in name.contains { $0.hasPrefix(w) } }
+    }
+    return matches.isEmpty ? hits : matches
+}
+
 func itunesArtistHits(_ json: [String: Any]) -> [SearchHit] {
     ((json["results"] as? [[String: Any]]) ?? []).compactMap { r in
         guard let id = r["artistId"] as? Int, let name = r["artistName"] as? String else { return nil }
@@ -147,7 +163,7 @@ func searchCatalog(kind: String, query: String) -> (hits: [SearchHit], error: St
         return (itunesAlbumHits(j), "")
     case "artist":
         guard let j = itunesJSON("https://itunes.apple.com/search?term=\(q)&entity=musicArtist&limit=15") else { return ([], "Apple's catalog did not answer. Try again in a moment.") }
-        return (itunesArtistHits(j), "")
+        return (relevantArtists(itunesArtistHits(j), query: query), "")
     default:
         guard let j = deezerJSON("https://api.deezer.com/search/playlist?q=\(q)&limit=30") else { return ([], "Deezer did not answer. Try again in a moment.") }
         return (deezerPlaylistHits(j), "")
@@ -226,4 +242,11 @@ func catalogSelfTest(_ eq: (Any, Any, String) -> Void) {
     let dt = deezerTrack(["title": "Dance", "duration": 200, "artist": ["name": "Band"], "album": ["title": "LP", "cover_xl": "https://x/xl.jpg"]])
     eq(dt?.durationMs ?? 0, 200000, "deezer seconds to ms"); eq(dt?.album ?? "", "LP", "deezer album"); eq(dt?.artURL ?? "", "https://x/xl.jpg", "deezer art")
     eq(itunesArtistHits(["results": [["artistId": 9, "artistName": "ישי ריבו", "primaryGenreName": "Pop"]]]).first?.id ?? "", "itunes:artist:9", "artist hit")
+    let artists = [SearchHit(id: "a", title: "The Miami Boys Choir", subtitle: "", detail: ""), SearchHit(id: "b", title: "Al Green", subtitle: "", detail: ""),
+                   SearchHit(id: "c", title: "Yerachmiel Begun & the Miami Boys Choir", subtitle: "", detail: "")]
+    eq(relevantArtists(artists, query: "miami boys choir").map { $0.id }, ["a", "c"], "unrelated artists dropped")
+    eq(relevantArtists(artists, query: "Beyoncé").map { $0.id }, ["a", "b", "c"], "nothing matches: keep all rather than show nothing")
+    eq(relevantArtists([SearchHit(id: "x", title: "Beyoncé", subtitle: "", detail: "")], query: "beyonce").map { $0.id }, ["x"], "accents ignored")
+    eq(relevantArtists([SearchHit(id: "h", title: "ישי ריבו", subtitle: "", detail: "")], query: "ישי").map { $0.id }, ["h"], "Hebrew words match")
+    eq(relevantArtists(artists, query: "mia").map { $0.id }, ["a", "c"], "partial words match word starts")
 }

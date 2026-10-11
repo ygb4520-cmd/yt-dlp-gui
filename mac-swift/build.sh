@@ -2,12 +2,12 @@
 # Builds "yt-dlp GUI.app" from the Swift sources (needs Xcode or the Command Line Tools). Opens no window.
 set -e
 cd "$(dirname "$0")"
-APP="build/yt-dlp GUI.app"
-rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -swift-version 5 -O -target arm64-apple-macos13.0 -framework AVFoundation -framework CoreMedia Sources/*.swift -o build/yt-dlp-gui-arm64
-swiftc -swift-version 5 -O -target x86_64-apple-macos13.0 -framework AVFoundation -framework CoreMedia Sources/*.swift -o build/yt-dlp-gui-x86_64
-lipo -create build/yt-dlp-gui-arm64 build/yt-dlp-gui-x86_64 -output "$APP/Contents/MacOS/yt-dlp-gui"
-rm build/yt-dlp-gui-arm64 build/yt-dlp-gui-x86_64
+APP="build.noindex/yt-dlp GUI.app"
+rm -rf build.noindex && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+swiftc -swift-version 5 -O -target arm64-apple-macos13.0 -framework AVFoundation -framework CoreMedia Sources/*.swift -o build.noindex/yt-dlp-gui-arm64
+swiftc -swift-version 5 -O -target x86_64-apple-macos13.0 -framework AVFoundation -framework CoreMedia Sources/*.swift -o build.noindex/yt-dlp-gui-x86_64
+lipo -create build.noindex/yt-dlp-gui-arm64 build.noindex/yt-dlp-gui-x86_64 -output "$APP/Contents/MacOS/yt-dlp-gui"
+rm build.noindex/yt-dlp-gui-arm64 build.noindex/yt-dlp-gui-x86_64
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # made by make_icon.swift + iconutil
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
