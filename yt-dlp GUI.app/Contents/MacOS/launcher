@@ -1,0 +1,4 @@
+#!/bin/bash
+export TK_SILENCE_DEPRECATION=1
+DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+exec /usr/bin/python3 "$DIR/yt_gui.py" "$@"
