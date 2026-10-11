@@ -147,6 +147,122 @@ def open_path(path, reveal=False):
         pass
 
 
+# ---------------------------------------------------------------- updates (same idea as the Mac app's and the Hebrew Cursive Scanner's):
+# ask GitHub for the latest release, compare it with this version, download the Windows zip, check it, swap the files.
+VERSION = '1.0.0'
+UPDATE_REPO = 'ygb4520-cmd/yt-dlp-gui'
+UPDATE_FILES = ('yt_gui.py', 'Start yt-dlp GUI.bat', 'README.md')   # the only files an update may replace
+
+
+def version_parts(v):
+    return [int(re.sub(r'\D', '', p) or 0) for p in v.strip().lstrip('vV').split('.')]
+
+
+def compare_versions(a, b):
+    """1 if a is newer than b, -1 if older, 0 if the same."""
+    pa, pb = version_parts(a), version_parts(b)
+    for i in range(max(len(pa), len(pb))):
+        d = (pa[i] if i < len(pa) else 0) - (pb[i] if i < len(pb) else 0)
+        if d:
+            return 1 if d > 0 else -1
+    return 0
+
+
+def parse_release(j, current):
+    """Reads GitHub's "latest release" answer. Returns a dict, or None when there is nothing newer for Windows."""
+    tag = j.get('tag_name') or ''
+    if not tag or compare_versions(tag, current) <= 0 or j.get('draft') or j.get('prerelease'):
+        return None
+    for a in j.get('assets') or []:
+        name, url = a.get('name') or '', a.get('browser_download_url') or ''
+        if name.lower().endswith('-windows.zip') and (url.startswith('https://github.com/%s/releases/download/' % UPDATE_REPO) or url.startswith('file://')):
+            digest = (a.get('digest') or '')
+            return {'version': tag.lstrip('vV'), 'asset_name': name, 'asset_url': url, 'release_url': j.get('html_url') or '',
+                    'sha256': digest[7:].lower() if digest.startswith('sha256:') else None}
+    return None
+
+
+def check_for_update():
+    """Returns (info or None, error). Tests can point YTGUI_UPDATE_FEED at a release file."""
+    import urllib.request
+    feed = os.environ.get('YTGUI_UPDATE_FEED') or 'https://api.github.com/repos/%s/releases/latest' % UPDATE_REPO
+    try:
+        req = urllib.request.Request(feed, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'yt-dlp-gui/' + VERSION})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read().decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        return None, '' if e.code == 404 else 'GitHub answered with HTTP %d' % e.code   # 404: no release published yet
+    except Exception as e:
+        return None, 'could not reach GitHub (%s)' % e
+    return parse_release(j, VERSION), ''
+
+
+def stage_update(info, progress=None):
+    """Downloads the update and checks it. Returns (folder with the new files, error)."""
+    import hashlib
+    import tempfile
+    import urllib.request
+    import zipfile
+    tmp = tempfile.mkdtemp(prefix='ytgui-update-')
+
+    def fail(msg):
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, msg
+    try:
+        zpath = os.path.join(tmp, 'update.zip')
+        req = urllib.request.Request(info['asset_url'], headers={'User-Agent': 'yt-dlp-gui/' + VERSION})
+        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, 'wb') as out:
+            total, got = int(r.headers.get('Content-Length') or 0), 0
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+                got += len(chunk)
+                if progress and total:
+                    progress(got / total)
+        if info.get('sha256'):
+            h = hashlib.sha256()
+            with open(zpath, 'rb') as f:
+                for chunk in iter(lambda: f.read(65536), b''):
+                    h.update(chunk)
+            if h.hexdigest() != info['sha256']:
+                return fail("the download does not match GitHub's checksum, so it was not installed")
+        newdir = os.path.join(tmp, 'new')
+        os.makedirs(newdir)
+        with zipfile.ZipFile(zpath) as z:
+            for member in z.namelist():
+                base = os.path.basename(member)
+                if base in UPDATE_FILES and not member.endswith('/'):   # only our own files, never a path from inside the zip
+                    with z.open(member) as src, open(os.path.join(newdir, base), 'wb') as dst:
+                        shutil.copyfileobj(src, dst)
+        script = os.path.join(newdir, 'yt_gui.py')
+        if not os.path.isfile(script):
+            return fail('the update did not contain the program')
+        source = open(script, encoding='utf-8').read()
+        compile(source, script, 'exec')   # must at least be valid Python
+        m = re.search(r"^VERSION = '([^']+)'", source, re.M)
+        if not m or compare_versions(m.group(1), VERSION) <= 0:
+            return fail('the update is not newer than this version')
+        return newdir, ''
+    except Exception as e:
+        return fail(str(e))
+
+
+def apply_update(newdir, target_dir):
+    """Copies the new files over the old ones (each written to a temporary name first). Returns an error text or ''."""
+    try:
+        for name in UPDATE_FILES:
+            src = os.path.join(newdir, name)
+            if os.path.isfile(src):
+                tmp = os.path.join(target_dir, name + '.new')
+                shutil.copyfile(src, tmp)
+                os.replace(tmp, os.path.join(target_dir, name))
+        return ''
+    except OSError as e:
+        return 'could not install: %s' % e
+
+
 # ---------------------------------------------------------------- Spotify (song / album / playlist) -> search YouTube
 MAX_TRACKS = 200
 DURATION_SLACK = 10   # seconds either way when matching a YouTube result to the Spotify song
@@ -881,6 +997,8 @@ def main(smoke=False, shot=None):
             self.ffmpeg = find_ffmpeg()
             self.files = {}
             self.busy = False
+            self.updating = False
+            self.update_info = None
             s = load_settings()
             self.mode = tk.StringVar(value=s.get('mode', 'video') if s.get('mode') in ('audio', 'video') else 'video')
             self.height = tk.StringVar(value=s.get('height', '720') if s.get('height') in HEIGHTS else '720')
@@ -891,6 +1009,7 @@ def main(smoke=False, shot=None):
             self.build()
             self.mode_changed()
             self.after(100, self.poll)
+            self.after(2000, lambda: self.check_updates(False))
             if not self.base:
                 self.notice('yt-dlp was not found. Put the yt-dlp program in your Downloads folder (or next to this app) and restart. Get it from github.com/yt-dlp/yt-dlp/releases.')
             elif not self.js:
@@ -898,7 +1017,16 @@ def main(smoke=False, shot=None):
 
         def build(self):
             pad = {'padx': 12, 'pady': 4}
-            ttk.Label(self, text='Links (one per line)').pack(anchor='w', **pad)
+            self.banner = ttk.Frame(self)   # shown only when a newer version exists
+            self.banner_text = ttk.Label(self.banner)
+            self.banner_text.pack(side='left', padx=(10, 8), pady=8)
+            self.banner_later = ttk.Button(self.banner, text='Later', command=lambda: self.banner.pack_forget())
+            self.banner_later.pack(side='right', padx=(0, 10))
+            self.banner_go = ttk.Button(self.banner, text='Update now', command=self.install_update)
+            self.banner_go.pack(side='right', padx=6)
+            self.banner_bar = ttk.Progressbar(self.banner, maximum=100, length=120)
+            self.links_label = ttk.Label(self, text='Links (one per line)')
+            self.links_label.pack(anchor='w', **pad)
             ttk.Label(self, foreground='#777777', wraplength=600, justify='left',
                       text='Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.').pack(anchor='w', padx=12)
             box = ttk.Frame(self)
@@ -913,16 +1041,20 @@ def main(smoke=False, shot=None):
             row = ttk.Frame(self)
             row.pack(fill='x', **pad)
             ttk.Radiobutton(row, text='Video', variable=self.mode, value='video', command=self.mode_changed).pack(side='left')
-            ttk.Radiobutton(row, text='Audio only', variable=self.mode, value='audio', command=self.mode_changed).pack(side='left', padx=(10, 16))
-            ttk.Label(row, text='Max height').pack(side='left')
-            self.height_box = ttk.Combobox(row, textvariable=self.height, values=HEIGHTS, width=6, state='readonly')
-            self.height_box.pack(side='left', padx=(6, 16))
-            ttk.Checkbutton(row, text='Whole playlist', variable=self.playlist).pack(side='left', padx=(0, 10))
-            ttk.Checkbutton(row, text='Choose songs', variable=self.ask_songs).pack(side='left', padx=(0, 16))
-            ttk.Label(row, text='Audio').pack(side='left')
-            self.audio_box = ttk.Combobox(row, textvariable=self.audio_format, values=['m4a', 'best'], width=6, state='readonly')
+            ttk.Radiobutton(row, text='Audio only', variable=self.mode, value='audio', command=self.mode_changed).pack(side='left', padx=(10, 0))
+            self.height_wrap = ttk.Frame(row)
+            ttk.Label(self.height_wrap, text='Max height').pack(side='left')
+            self.height_box = ttk.Combobox(self.height_wrap, textvariable=self.height, values=HEIGHTS, width=6, state='readonly')
+            self.height_box.pack(side='left', padx=(6, 0))
+            self.audio_wrap = ttk.Frame(row)
+            ttk.Label(self.audio_wrap, text='Audio').pack(side='left')
+            self.audio_box = ttk.Combobox(self.audio_wrap, textvariable=self.audio_format, values=['m4a', 'best'], width=6, state='readonly')
             self.audio_box.pack(side='left', padx=(6, 0))
             self.audio_box.bind('<<ComboboxSelected>>', lambda e: self.mode_changed())
+            row2 = ttk.Frame(self)
+            row2.pack(fill='x', **pad)
+            ttk.Checkbutton(row2, text='Whole playlist', variable=self.playlist).pack(side='left', padx=(0, 14))
+            ttk.Checkbutton(row2, text='Choose songs from albums and playlists', variable=self.ask_songs).pack(side='left')
 
             self.hint = ttk.Label(self, foreground='#777777', wraplength=600, justify='left')
             self.hint.pack(anchor='w', padx=12)
@@ -955,12 +1087,23 @@ def main(smoke=False, shot=None):
             ttk.Label(self, text='Double-click a finished row to show the file.', foreground='#777777').pack(anchor='w', padx=12)
 
             self.log = tk.Text(self, height=5, wrap='word', state='disabled')
-            self.log.pack(fill='x', padx=12, pady=(4, 12))
+            self.log.pack(fill='x', padx=12, pady=(4, 4))
+            foot = ttk.Frame(self)
+            foot.pack(fill='x', padx=12, pady=(0, 10))
+            ttk.Label(foot, text='yt-dlp GUI %s' % VERSION, foreground='#777777').pack(side='left')
+            self.check_btn = ttk.Button(foot, text='Check for updates', command=lambda: self.check_updates(True))
+            self.check_btn.pack(side='left', padx=8)
+            self.update_msg = ttk.Label(foot, foreground='#777777')
+            self.update_msg.pack(side='left')
 
         def mode_changed(self):
             video = self.mode.get() == 'video'
-            self.height_box.configure(state='readonly' if video else 'disabled')
-            self.audio_box.configure(state='disabled' if video else 'readonly')
+            if video:
+                self.audio_wrap.pack_forget()
+                self.height_wrap.pack(side='left', padx=(18, 0))
+            else:
+                self.height_wrap.pack_forget()
+                self.audio_wrap.pack(side='left', padx=(18, 0))
             if not video:
                 msg = ('Audio "best": the highest-quality audio the site has, often .webm (opus). YouTube audio tops out around 130-160 kbps either way.'
                        if self.audio_format.get() == 'best' else
@@ -1024,6 +1167,43 @@ def main(smoke=False, shot=None):
             self.go.configure(state='disabled')
             self.bar['value'] = 0
             self.dl.start(self.base, lines, self.mode.get(), self.height.get(), folder, self.playlist.get(), self.js, self.ffmpeg, self.audio_format.get(), self.ask_songs.get())
+
+        def check_updates(self, manual):
+            if self.updating:
+                return
+            if manual:
+                self.update_msg.configure(text='Checking...')
+
+            def work():
+                info, err = check_for_update()
+                self.events.put(('update_found', info, err, manual))
+            threading.Thread(target=work, daemon=True).start()
+
+        def install_update(self):
+            info = self.update_info
+            if not info or self.updating:
+                return
+            self.updating = True
+            self.banner_go.configure(state='disabled')
+            self.banner_later.configure(state='disabled')
+            self.banner_bar.pack(side='right', padx=6)
+            self.banner_text.configure(text='Downloading version %s...' % info['version'])
+
+            def work():
+                newdir, err = stage_update(info, lambda f: self.events.put(('update_progress', f)))
+                if err:
+                    self.events.put(('update_done', err))
+                    return
+                err = apply_update(newdir, os.path.dirname(os.path.abspath(__file__)))
+                self.events.put(('update_done', err))
+            threading.Thread(target=work, daemon=True).start()
+
+        def restart(self):
+            try:
+                subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+            except OSError:
+                pass
+            self.destroy()
 
         def add_links(self, lines):
             cur = self.links.get('1.0', 'end-1c')
@@ -1221,7 +1401,30 @@ def main(smoke=False, shot=None):
             try:
                 while True:
                     ev = self.events.get_nowait()
-                    if ev[0] == 'choose':
+                    if ev[0] == 'update_found':
+                        _, info, err, manual = ev
+                        if info:
+                            self.update_info = info
+                            self.banner_text.configure(text='Version %s is available (you have %s).' % (info['version'], VERSION))
+                            self.banner.pack(fill='x', padx=12, pady=(10, 0), before=self.links_label)
+                            self.update_msg.configure(text='Version %s is available.' % info['version'])
+                        elif err:
+                            self.update_msg.configure(text=('Could not check for updates: %s' % err) if manual else '')
+                        else:
+                            self.update_msg.configure(text=('You have the latest version (%s).' % VERSION) if manual else '')
+                    elif ev[0] == 'update_progress':
+                        self.banner_bar['value'] = ev[1] * 100
+                    elif ev[0] == 'update_done':
+                        self.updating = False
+                        self.banner_bar.pack_forget()
+                        if ev[1]:
+                            self.banner_text.configure(text='Update failed: %s' % ev[1])
+                            self.banner_go.configure(state='normal')
+                            self.banner_later.configure(state='normal')
+                        else:
+                            self.banner_text.configure(text='Updated. Restarting...')
+                            self.after(500, self.restart)
+                    elif ev[0] == 'choose':
                         self.choose_dialog(ev[1], ev[2], ev[3])
                     elif ev[0] == 'plan':
                         for i, label in enumerate(ev[1]):
@@ -1473,6 +1676,29 @@ def selftest():
         eq(True, False, 'non-mp4 should fail')
     except ValueError:
         eq(True, True, 'non-mp4 rejected')
+
+    # updates
+    eq(compare_versions('1.2.0', '1.1.9'), 1, 'newer minor')
+    eq(compare_versions('v1.0.0', '1.0.0'), 0, 'v prefix ignored')
+    eq(compare_versions('1.0', '1.0.0'), 0, 'missing part is zero')
+    eq(compare_versions('1.9.0', '1.10.0'), -1, 'numbers, not text')
+    eq(compare_versions('2.0.0', '1.99.99'), 1, 'major wins')
+    win = 'https://github.com/%s/releases/download/v1.1.0/yt-dlp-GUI-windows.zip' % UPDATE_REPO
+    rel = {'tag_name': 'v1.1.0', 'html_url': 'https://github.com/x/y/releases/tag/v1.1.0', 'assets': [
+        {'name': 'yt-dlp-GUI-mac.zip', 'browser_download_url': 'https://github.com/%s/releases/download/v1.1.0/yt-dlp-GUI-mac.zip' % UPDATE_REPO},
+        {'name': 'yt-dlp-GUI-windows.zip', 'browser_download_url': win, 'digest': 'sha256:ABCDEF12'}]}
+    inf = parse_release(rel, '1.0.0')
+    eq((inf['version'], inf['asset_url'], inf['sha256']), ('1.1.0', win, 'abcdef12'), 'newer release found; Windows file chosen, Mac one ignored')
+    eq(parse_release(rel, '1.1.0'), None, 'same version: nothing to do')
+    eq(parse_release(dict(rel, draft=True), '1.0.0'), None, 'drafts ignored')
+    eq(parse_release(dict(rel, prerelease=True), '1.0.0'), None, 'pre-releases ignored')
+    eq(parse_release(dict(rel, assets=[rel['assets'][0]]), '1.0.0'), None, 'no Windows file yet: nothing to do')
+    eq(parse_release(dict(rel, assets=[{'name': 'x-windows.zip', 'browser_download_url': 'https://evil.example.com/x-windows.zip'}]), '1.0.0'), None, 'files from other sites are never downloaded')
+    eq(parse_release(dict(rel, assets=[{'name': 'x-windows.zip', 'browser_download_url': 'https://github.com/someone-else/repo/releases/download/v1/x-windows.zip'}]), '1.0.0'), None, 'files from other repositories are never downloaded')
+    eq(parse_release({'tag_name': 'v9.0.0'}, '1.0.0'), None, 'release without files')
+    vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')
+    if os.path.isfile(vf):
+        eq(open(vf).read().strip(), VERSION, 'VERSION constant matches the VERSION file')
     f = find_ytdlp()
     eq(f is None or isinstance(f, list), True, 'find_ytdlp type')
     ff = find_ffmpeg()
@@ -1486,6 +1712,24 @@ def selftest():
 if __name__ == '__main__':
     if '--selftest' in sys.argv:
         sys.exit(0 if selftest() else 1)
+    if '--checkupdate' in sys.argv:   # asks GitHub for the latest release and says what the app would do (opens no window)
+        info, err = check_for_update()
+        print(('update available: %s (you have %s) -> %s' % (info['version'], VERSION, info['asset_url'])) if info else ('could not check: ' + err if err else 'up to date (%s); no newer release found' % VERSION))
+        sys.exit(0)
+    if '--update-test' in sys.argv:   # --update-test <folder>: download the update and put its files in that folder (nothing restarts)
+        dest = sys.argv[sys.argv.index('--update-test') + 1]
+        info, err = check_for_update()
+        if not info:
+            print('no update: ' + (err or 'nothing newer'))
+            sys.exit(0)
+        newdir, err = stage_update(info, None)
+        if err:
+            print('update failed: ' + err)
+            sys.exit(1)
+        os.makedirs(dest, exist_ok=True)
+        err = apply_update(newdir, dest)
+        print('update failed: ' + err if err else 'installed version %s into %s' % (info['version'], dest))
+        sys.exit(1 if err else 0)
     if '--search' in sys.argv:   # --search <song|album|artist|playlist> <words...> [--albums]   (prints the results; opens no window)
         a = sys.argv[sys.argv.index('--search') + 1:]
         kind, words = a[0], [w for w in a[1:] if w != '--albums']

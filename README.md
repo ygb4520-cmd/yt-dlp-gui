@@ -10,6 +10,9 @@ A small window for downloading video or audio with [yt-dlp](https://github.com/y
 - A YouTube download that fails with "403 Forbidden" is retried automatically (up to 3 tries), because YouTube does that at random.
 - **Audio quality:** choose "m4a" (plays everywhere) or "best available" (often .webm/opus). YouTube audio tops out around 128-160 kbps either way. **Video quality:** choose a max height; without ffmpeg, YouTube video is limited to the single-file formats it still offers (up to 360p).
 
+## Updates
+Both versions check GitHub for a newer release when they start (and when you press **Check for updates**), and show a banner with **Update now**. The Mac app downloads the new app, checks it (it must be this app, newer, correctly signed and match GitHub's checksum), swaps itself and reopens. The Windows version replaces its own files and restarts. To publish an update: raise the number in `VERSION` and in `yt_gui.py`, commit and push, then run `NOTES="what changed" ./release.sh`, which builds, tags `v<version>` and uploads `yt-dlp-GUI-mac.zip` and `yt-dlp-GUI-windows.zip`. Download the first copy from the [latest release](https://github.com/ygb4520-cmd/yt-dlp-gui/releases/latest); on a Mac, right-click the app and choose Open once (it is signed ad hoc, not by Apple).
+
 ## Mac (native Swift app)
 `cd mac-swift && ./build.sh` builds a universal `build.noindex/yt-dlp GUI.app` (the `.noindex` folder keeps Spotlight from listing a second copy) (needs Xcode or the Command Line Tools). Copy it to Applications. No Python needed. It looks for `yt-dlp` on your PATH, in `~/Applications`, and in Downloads; or press "Locate yt-dlp...".
 Logic check without a window: `"build.noindex/yt-dlp GUI.app/Contents/MacOS/yt-dlp-gui" --selftest`

@@ -125,6 +125,13 @@ final class DebugDriver {
         case "size":
             let n = arg.split(separator: " ").compactMap { Double($0) }
             if n.count == 2, let w = mainWindow() { w.setContentSize(NSSize(width: n[0], height: n[1])); note("window content size set to \(Int(n[0]))x\(Int(n[1]))") }
+        // updates (set YTGUI_UPDATE_FEED to a test release file; "installupdate <folder>" puts the new app in that folder instead of replacing this one)
+        case "checkupdates": model.checkUpdates(manual: true)
+        case "waitupdatecheck": await waitFor(60, "update check") { !model.updateBusy }
+        case "installupdate":
+            var finished = false
+            model.installUpdate(testDestination: URL(fileURLWithPath: (arg as NSString).expandingTildeInPath).appendingPathComponent("yt-dlp GUI.app")) { finished = true }
+            await waitFor(120, "update install") { finished }
         case "shot": break
         case "quit": NSApp.terminate(nil)
         default: note("unknown command: \(name)")
@@ -140,6 +147,7 @@ final class DebugDriver {
         if let w = mainWindow() { out += "window: content \(Int(w.contentView?.bounds.width ?? 0))x\(Int(w.contentView?.bounds.height ?? 0)) (min \(Int(w.contentMinSize.width))x\(Int(w.contentMinSize.height)))\n" }
         out += "settings: mode=\(d.string(forKey: "mode") ?? "video") height=\(d.string(forKey: "height") ?? "720") audioFormat=\(d.string(forKey: "audioFormat") ?? "m4a") "
         out += "playlist=\((d.object(forKey: "playlist") as? Bool) ?? false) askSongs=\((d.object(forKey: "askSongs") as? Bool) ?? true) folder=\(d.string(forKey: "folder") ?? defaultFolder)\n"
+        out += "version: \(appVersion) | update available: \(model.update?.version ?? "none") | update message: \(model.updateMessage)\(model.updateProgress.map { " | downloading \(Int($0 * 100))%" } ?? "")\n"
         out += "tools: yt-dlp=\(model.ytdlp ?? "NOT FOUND") node/deno=\(model.hasJS) ffmpeg=\(model.hasFFmpeg)\n"
         out += "links box (\(model.links.split(whereSeparator: \.isNewline).count) lines):\n" + model.links + "\n"
         out += "rows (\(model.rows.count)), progress \(Int(model.progress))%, \(model.speedText):\n"
@@ -154,7 +162,7 @@ final class DebugDriver {
         for (i, h) in s.hits.prefix(15).enumerated() { out += "  [\(i)]\(s.selection.contains(h.id) ? "*" : " ") \(h.id) | \(h.title) | \(h.subtitle) | \(h.detail)\n" }
         out += "--- app log ---\n" + model.log.split(separator: "\n").suffix(12).joined(separator: "\n") + "\n"
         out += "--- driver log ---\n" + log.suffix(15).joined(separator: "\n") + "\n"
-        out += "--- commands: links <text, \\n for new line> | addlink <line> | mode video|audio | height best|1080|720|480|360 | audioformat m4a|best | playlist on|off | asksongs on|off | folder <path> | download | cancel | waitidle | wait <s> | search | closesearch | searchkind song|album|artist|playlist | query <text> | dosearch | waitsearch | searchselect <i,j|all|none> | showalbums <i> | searchback | searchadd | waitpicker | pickall | picknone | picktoggle <i> | pickok | pickskip | size <w> <h> | shot | quit ---\n"
+        out += "--- commands: links <text, \\n for new line> | addlink <line> | mode video|audio | height best|1080|720|480|360 | audioformat m4a|best | playlist on|off | asksongs on|off | folder <path> | download | cancel | waitidle | wait <s> | search | closesearch | searchkind song|album|artist|playlist | query <text> | dosearch | waitsearch | searchselect <i,j|all|none> | showalbums <i> | searchback | searchadd | waitpicker | pickall | picknone | picktoggle <i> | pickok | pickskip | checkupdates | waitupdatecheck | installupdate <test folder> | size <w> <h> | shot | quit ---\n"
         try? out.write(to: directory.appendingPathComponent("status.txt"), atomically: true, encoding: .utf8)
     }
 

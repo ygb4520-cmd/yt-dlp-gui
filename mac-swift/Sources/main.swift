@@ -7,6 +7,13 @@ let args = CommandLine.arguments
 if args.contains("--selftest") {
     exit(selfTest() ? 0 : 1)
 }
+if args.contains("--checkupdate") {   // asks GitHub for the latest release and says what the app would do (opens no window)
+    let r = checkForUpdate()
+    if let i = r.info { print("update available: \(i.version) (you have \(appVersion)) -> \(i.assetURL)") }
+    else if !r.error.isEmpty { print("could not check: \(r.error)") }
+    else { print("up to date (\(appVersion)); no newer release found") }
+    exit(0)
+}
 if let i = args.firstIndex(of: "--search"), args.count > i + 2 {   // --search <song|album|artist|playlist> <words...>   (prints the results; opens no window)
     let kind = args[i + 1]
     let query = args[(i + 2)...].filter { $0 != "--albums" }.joined(separator: " ")

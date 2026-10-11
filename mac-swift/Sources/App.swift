@@ -37,6 +37,12 @@ final class Model: ObservableObject {
     @Published var hasJS = false
     @Published var hasFFmpeg = false
 
+    // updates
+    @Published var update: UpdateInfo?
+    @Published var updateMessage = ""
+    @Published var updateProgress: Double?          // nil unless an update is downloading
+    @Published var updateBusy = false
+
     let search = SearchModel()
     private let runner = Runner()
     private var js: (String, String)?
@@ -45,6 +51,60 @@ final class Model: ObservableObject {
     init() {
         refreshTools(saved: UserDefaults.standard.string(forKey: "ytdlpPath"))
         search.addLines = { [unowned self] lines in self.addLinks(lines) }
+        // look for a newer version a moment after start (not during tests, unless they supply their own update file)
+        if !debugDriverRequested || ProcessInfo.processInfo.environment["YTGUI_UPDATE_FEED"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.checkUpdates(manual: false) }
+        }
+    }
+
+    func checkUpdates(manual: Bool) {
+        guard !updateBusy, updateProgress == nil else { return }
+        updateBusy = true
+        if manual { updateMessage = "Checking..." }
+        DispatchQueue.global(qos: .utility).async {
+            let r = checkForUpdate()
+            DispatchQueue.main.async {
+                self.updateBusy = false
+                if let info = r.info {
+                    self.update = info
+                    self.updateMessage = "Version \(info.version) is available."
+                } else if !r.error.isEmpty {
+                    if manual { self.updateMessage = "Could not check for updates: \(r.error)" } else { self.updateMessage = "" }
+                } else {
+                    self.updateMessage = manual ? "You have the latest version (\(appVersion))." : ""
+                }
+            }
+        }
+    }
+
+    /// Downloads, checks and installs the update, then restarts the app. With `testDestination` (tests only) the new app
+    /// is put there instead, and nothing quits or restarts.
+    func installUpdate(testDestination: URL? = nil, done: (() -> Void)? = nil) {
+        guard let info = update, updateProgress == nil else { return }
+        updateProgress = 0
+        updateMessage = "Downloading version \(info.version)..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let staged = stageUpdate(info) { frac in DispatchQueue.main.async { self.updateProgress = frac } }
+            guard let app = staged.app, let tmp = staged.tempDir else {
+                DispatchQueue.main.async { self.updateProgress = nil; self.updateMessage = "Update failed: \(staged.error)"; done?() }
+                return
+            }
+            DispatchQueue.main.async { self.updateMessage = "Installing..." }
+            let dest = testDestination ?? installDestination()
+            let err = applyUpdate(staged: app, tempDir: tmp, destination: dest, relaunch: testDestination == nil)
+            DispatchQueue.main.async {
+                self.updateProgress = nil
+                if !err.isEmpty { self.updateMessage = "Update failed: \(err)"; done?(); return }
+                if testDestination != nil {
+                    self.updateMessage = "Installed version \(info.version) to \(dest.path) (test: no restart)."
+                    self.update = nil
+                    done?()
+                } else {
+                    self.updateMessage = "Restarting..."
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSApp.terminate(nil) }
+                }
+            }
+        }
     }
 
     func refreshTools(saved: String?) {
@@ -161,6 +221,20 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if let u = model.update {
+                HStack(spacing: 10) {
+                    Text("Version \(u.version) is available (you have \(appVersion)).").fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    if let p = model.updateProgress {
+                        ProgressView(value: p).frame(width: 120)
+                    } else {
+                        Button("Update now") { model.installUpdate() }.keyboardShortcut(.defaultAction)
+                        Button("Later") { model.update = nil }
+                    }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.15)))
+            }
             Text("Links (one per line)").font(.headline)
             Text("Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.")
                 .font(.footnote).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -254,9 +328,16 @@ struct ContentView: View {
             .frame(height: 80)
             .padding(6)
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.4)))
+
+            HStack(spacing: 10) {
+                Text("yt-dlp GUI \(appVersion)").font(.footnote).foregroundColor(.secondary)
+                Button("Check for updates") { model.checkUpdates(manual: true) }.controlSize(.small).disabled(model.updateBusy || model.updateProgress != nil)
+                Text(model.updateMessage).font(.footnote).foregroundColor(.secondary).lineLimit(2)
+                Spacer(minLength: 0)
+            }
         }
         .padding(16)
-        .frame(minWidth: 620, maxWidth: .infinity, minHeight: 600)
+        .frame(minWidth: 620, maxWidth: .infinity, minHeight: 640)
         .sheet(item: $model.picker, onDismiss: { model.finishPicker(nil) }) { p in
             SongPicker(state: p) { model.finishPicker($0) }
         }
