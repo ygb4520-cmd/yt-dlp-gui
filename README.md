@@ -4,7 +4,7 @@ A small window for downloading video or audio with [yt-dlp](https://github.com/y
 
 - Paste links (one per line), choose Video or Audio only, pick a save folder, press Download.
 - Audio is saved as it comes from the site (usually .m4a), no conversion.
-- Video: with ffmpeg it joins the best picture and sound; without ffmpeg it saves a single file with sound if the site offers one (YouTube no longer does, so use Audio only there, or install ffmpeg).
+- Video: with ffmpeg it joins the best picture and sound; without ffmpeg it saves a single file with sound if the site offers one (on YouTube that is up to 360p).
 - YouTube links work best with Node.js installed.
 
 ## Run

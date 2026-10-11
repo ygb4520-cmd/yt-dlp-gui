@@ -2,8 +2,7 @@
 """yt-dlp GUI: a small window for downloading video or audio with yt-dlp (Mac and Windows, standard library only).
 
 ffmpeg is optional. Without it, video comes as one ready-made file with the sound already in it (the best single-file
-quality the site offers; some sites, YouTube included, no longer offer one) and audio comes as m4a/webm without
-conversion. With ffmpeg found, video is joined from the best picture and sound. It only runs yt-dlp on your links.
+quality the site offers; on YouTube that is up to 360p) and audio comes as m4a/webm without conversion. With ffmpeg found, video is joined from the best picture and sound. It only runs yt-dlp on your links.
 """
 import glob
 import importlib.util
@@ -94,7 +93,7 @@ def format_for(mode, height, ffmpeg=None):
     return 'b[height<=%s][ext=mp4]/b[height<=%s]/b' % (height, height)
 
 
-NEEDS_FFMPEG = ('That site only offers the picture and the sound as separate streams (YouTube does this now), '
+NEEDS_FFMPEG = ('That site only offers the picture and the sound as separate streams, '
                 'and joining them needs ffmpeg. Audio only still works without it.')
 
 
@@ -108,6 +107,9 @@ def build_cmd(base, url, mode, height, folder, playlist, js, ffmpeg=None):
         '-f', format_for(mode, height, ffmpeg)]
     if ffmpeg and mode == 'video':
         cmd += ['--ffmpeg-location', ffmpeg, '--merge-output-format', 'mp4']
+    elif mode == 'video':
+        # YouTube's default clients no longer offer the older single-file formats (like 18, up to 360p); mweb still does.
+        cmd += ['--extractor-args', 'youtube:player_client=default,mweb']
     if js:
         cmd += ['--js-runtimes', '%s:%s' % js]
     return cmd + ['--', url]
@@ -308,7 +310,7 @@ def main(smoke=False):
             elif self.ffmpeg:
                 msg = 'ffmpeg found: video is joined from the best picture and sound, up to the height you choose.'
             else:
-                msg = 'No ffmpeg: video is saved as one file with sound in it, the best single-file quality the site offers. YouTube no longer offers one, so use Audio only there.'
+                msg = 'No ffmpeg: video is saved as one file with sound in it, the best single-file quality the site offers (on YouTube that is up to 360p).'
             self.hint.configure(text=msg)
 
         def notice(self, text):
@@ -430,6 +432,9 @@ def selftest():
     eq(cf[cf.index('--ffmpeg-location') + 1], '/f/ffmpeg', 'ffmpeg location passed')
     eq('--ffmpeg-location' in build_cmd(['y'], 'https://a', 'audio', '720', '/t', False, None, '/f'), False, 'no ffmpeg flag for audio')
     eq('--ffmpeg-location' in c, False, 'no ffmpeg flag without ffmpeg')
+    eq(c[c.index('--extractor-args') + 1], 'youtube:player_client=default,mweb', 'mweb client added without ffmpeg')
+    eq('--extractor-args' in cf, False, 'no client override when ffmpeg merges')
+    eq('--extractor-args' in build_cmd(['y'], 'https://a', 'audio', '720', '/t', False, None), False, 'no client override for audio')
     eq(c[0], 'yt-dlp', 'base first')
     eq(c[-2:], ['--', 'https://a.com/v'], 'url after --')
     eq('--no-playlist' in c, True, 'no playlist default')
