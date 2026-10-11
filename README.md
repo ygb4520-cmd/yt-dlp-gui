@@ -8,7 +8,7 @@ A small window for downloading video or audio with [yt-dlp](https://github.com/y
 - YouTube links work best with Node.js installed.
 
 ## Run
-- **Mac:** double-click `yt-dlp GUI.app` (it uses the built-in /usr/bin/python3). Or `python3 yt_gui.py`.
+- **Mac:** install Python from python.org first (Apple's built-in Python has an old Tk that shows a blank window on recent macOS), then double-click `yt-dlp GUI.app`. Or `python3 yt_gui.py`.
 - **Windows:** install Python from python.org, then double-click `Start yt-dlp GUI.bat`.
 
 The app looks for `yt-dlp` on your PATH, next to the app, in `~/Applications`, and in Downloads. Get it from the yt-dlp releases page.

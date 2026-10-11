@@ -1,4 +1,11 @@
 #!/bin/bash
+# Apple's built-in Python ships an old Tk that draws a blank window (or crashes) on recent macOS.
+# Prefer a python.org Python (current Tk); fall back to the built-in one.
 export TK_SILENCE_DEPRECATION=1
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+for PY in /Library/Frameworks/Python.framework/Versions/Current/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+  if [ -x "$PY" ] && "$PY" -c 'import tkinter,sys; sys.exit(0 if tkinter.TkVersion >= 8.6 else 1)' 2>/dev/null; then
+    exec "$PY" "$DIR/yt_gui.py" "$@"
+  fi
+done
 exec /usr/bin/python3 "$DIR/yt_gui.py" "$@"

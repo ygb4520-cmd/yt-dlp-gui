@@ -222,7 +222,7 @@ def save_settings(d):
 
 
 # ---------------------------------------------------------------- window
-def main(smoke=False):
+def main(smoke=False, shot=None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -401,7 +401,12 @@ def main(smoke=False):
             self.after(100, self.poll)
 
     app = App()
-    if smoke:
+    if shot:   # debugging aid: screenshot this window, then quit
+        def take():
+            subprocess.run(['screencapture', '-x', shot])
+            app.destroy()
+        app.after(3500, take)
+    elif smoke:
         app.after(1500, app.destroy)
     app.mainloop()
     if smoke:
@@ -472,4 +477,5 @@ if __name__ == '__main__':
             if ev[0] == 'finished':
                 break
         sys.exit(0)
-    main(smoke='--smoke' in sys.argv)
+    shot_path = sys.argv[sys.argv.index('--shot') + 1] if '--shot' in sys.argv else None
+    main(smoke='--smoke' in sys.argv, shot=shot_path)
