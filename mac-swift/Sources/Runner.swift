@@ -44,23 +44,32 @@ func fetchSpotify(_ ref: SpotifyRef) -> (SpotifyList?, String) {
     return (list, "")
 }
 
-/// Turns the pasted lines into jobs: plain links stay as they are, Spotify links become one job per song.
+/// Turns the pasted lines into jobs: plain links stay as they are; Spotify links and search results ("itunes:album:123 # ...")
+/// become one job per song.
 func planJobs(lines: [String], baseFolder: String, log: (String) -> Void, choose: ((SpotifyList) -> [Int]?)? = nil) -> [Job] {
     var jobs: [Job] = []
     var plainLinks = 0
+
+    func addList(_ list: SpotifyList?, _ why: String, line: String, from: String) {
+        guard let l = list else { log("\(line)\n  \(why)"); return }
+        let folder = l.isCollection ? baseFolder + "/" + safeFileName(l.name) : baseFolder
+        var tracks = l.tracks
+        if l.isCollection, tracks.count > 1, let choose = choose {   // let the user pick which songs
+            guard let picked = choose(l), !picked.isEmpty else { log("Skipped \"\(l.name)\" (no songs chosen)."); return }
+            tracks = picked.sorted().filter { l.tracks.indices.contains($0) }.map { l.tracks[$0] }
+        }
+        if tracks.count > maxTracks { log("Only the first \(maxTracks) songs of \"\(l.name)\" are used."); tracks = Array(tracks.prefix(maxTracks)) }
+        log("\(from): \"\(l.name)\" - \(tracks.count == l.tracks.count ? "\(tracks.count)" : "\(tracks.count) of \(l.tracks.count)") song\(tracks.count == 1 ? "" : "s"). Looking on YouTube Music, then lyric videos, then music videos" + (l.isCollection ? ", saving into a folder named after it." : "."))
+        jobs += tracks.map { Job(label: trackLabel($0), target: .track($0), folder: folder) }
+    }
+
     for line in lines {
-        if let ref = parseSpotifyLink(line) {
+        if let ref = parseCatalogLine(line) {
+            let (list, why) = fetchCatalog(ref)
+            addList(list, why, line: line, from: ref.source == "deezer" ? "Deezer" : "Apple")
+        } else if let ref = parseSpotifyLink(line) {
             let (list, why) = fetchSpotify(ref)
-            guard let l = list else { log("\(line)\n  \(why)"); continue }
-            let folder = l.isCollection ? baseFolder + "/" + safeFileName(l.name) : baseFolder
-            var tracks = l.tracks
-            if l.isCollection, tracks.count > 1, let choose = choose {   // let the user pick which songs
-                guard let picked = choose(l), !picked.isEmpty else { log("Skipped \"\(l.name)\" (no songs chosen)."); continue }
-                tracks = picked.sorted().filter { l.tracks.indices.contains($0) }.map { l.tracks[$0] }
-            }
-            if tracks.count > maxTracks { log("Only the first \(maxTracks) songs of \"\(l.name)\" are used."); tracks = Array(tracks.prefix(maxTracks)) }
-            log("Spotify: \"\(l.name)\" - \(tracks.count == l.tracks.count ? "\(tracks.count)" : "\(tracks.count) of \(l.tracks.count)") song\(tracks.count == 1 ? "" : "s"). Looking on YouTube Music, then lyric videos, then music videos" + (l.isCollection ? ", saving into a folder named after it." : "."))
-            jobs += tracks.map { Job(label: trackLabel($0), target: .track($0), folder: folder) }
+            addList(list, why, line: line, from: "Spotify")
         } else if isSpotifyAddress(line) {
             log("\(line)\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; open the link in your browser and copy the song, album or playlist address.")
         } else if validURL(line) {
@@ -68,7 +77,7 @@ func planJobs(lines: [String], baseFolder: String, log: (String) -> Void, choose
             if plainLinks > maxLinks { if plainLinks == maxLinks + 1 { log("Only the first \(maxLinks) plain links are used.") }; continue }
             jobs.append(Job(label: line, target: .link(line), folder: baseFolder))
         } else {
-            log("Skipped (not an http/https link): \(String(line.prefix(60)))")
+            log("Skipped (not an http/https link or search result): \(String(line.prefix(60)))")
         }
     }
     return jobs

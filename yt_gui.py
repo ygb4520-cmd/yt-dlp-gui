@@ -345,30 +345,38 @@ def enrich_track(t):
 
 
 def plan_jobs(lines, base_folder, log, choose=None):
-    """Plain links stay as they are; Spotify links become one job per song."""
+    """Plain links stay as they are; Spotify links and search results ("itunes:album:123 # ...") become one job per song."""
     jobs, plain = [], 0
+
+    def add_list(lst, why, line, source):
+        if not lst:
+            log('%s\n  %s' % (line, why))
+            return
+        folder = os.path.join(base_folder, safe_file_name(lst['name'])) if lst['collection'] else base_folder
+        tracks = lst['tracks']
+        if lst['collection'] and len(tracks) > 1 and choose:   # let the user pick which songs
+            picked = choose(lst)
+            if not picked:
+                log('Skipped "%s" (no songs chosen).' % lst['name'])
+                return
+            tracks = [tracks[i] for i in sorted(set(picked)) if 0 <= i < len(tracks)]
+        if len(tracks) > MAX_TRACKS:
+            log('Only the first %d songs of "%s" are used.' % (MAX_TRACKS, lst['name']))
+            tracks = tracks[:MAX_TRACKS]
+        log('%s: "%s" - %s song%s. Looking on YouTube Music, then lyric videos, then music videos%s' % (
+            source, lst['name'], str(len(tracks)) if len(tracks) == len(lst['tracks']) else '%d of %d' % (len(tracks), len(lst['tracks'])),
+            '' if len(tracks) == 1 else 's', ', saving into a folder named after it.' if lst['collection'] else '.'))
+        jobs.extend({'label': track_label(t), 'kind': 'track', 'track': t, 'folder': folder} for t in tracks)
+
     for line in lines:
-        ref = parse_spotify_link(line)
-        if ref:
-            lst, why = fetch_spotify(*ref)
-            if not lst:
-                log('%s\n  %s' % (line, why))
-                continue
-            folder = os.path.join(base_folder, safe_file_name(lst['name'])) if lst['collection'] else base_folder
-            tracks = lst['tracks']
-            if lst['collection'] and len(tracks) > 1 and choose:   # let the user pick which songs
-                picked = choose(lst)
-                if not picked:
-                    log('Skipped "%s" (no songs chosen).' % lst['name'])
-                    continue
-                tracks = [tracks[i] for i in sorted(set(picked)) if 0 <= i < len(tracks)]
-            if len(tracks) > MAX_TRACKS:
-                log('Only the first %d songs of "%s" are used.' % (MAX_TRACKS, lst['name']))
-                tracks = tracks[:MAX_TRACKS]
-            log('Spotify: "%s" - %s song%s. Looking on YouTube Music, then lyric videos, then music videos%s' % (
-                lst['name'], str(len(tracks)) if len(tracks) == len(lst['tracks']) else '%d of %d' % (len(tracks), len(lst['tracks'])),
-                '' if len(tracks) == 1 else 's', ', saving into a folder named after it.' if lst['collection'] else '.'))
-            jobs += [{'label': track_label(t), 'kind': 'track', 'track': t, 'folder': folder} for t in tracks]
+        cref = parse_catalog_line(line)
+        sref = parse_spotify_link(line)
+        if cref:
+            lst, why = fetch_catalog(cref)
+            add_list(lst, why, line, 'Deezer' if cref[0] == 'deezer' else 'Apple')
+        elif sref:
+            lst, why = fetch_spotify(*sref)
+            add_list(lst, why, line, 'Spotify')
         elif is_spotify_address(line):
             log('%s\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; '
                 'open the link in your browser and copy the song, album or playlist address.' % line)
@@ -380,8 +388,209 @@ def plan_jobs(lines, base_folder, log, choose=None):
                 continue
             jobs.append({'label': line, 'kind': 'link', 'url': line, 'folder': base_folder})
         else:
-            log('Skipped (not an http/https link): ' + line[:60])
+            log('Skipped (not an http/https link or search result): ' + line[:60])
     return jobs
+
+
+# ---------------------------------------------------------------- music search without any account or key:
+# Apple's free catalog (songs, albums, artists) and Deezer's (playlists). Results become lines like
+# "itunes:album:123 # The Beatles - Abbey Road" in the link box; Download turns each line into its songs.
+CATALOG_LINE = re.compile(r'^(itunes|deezer):(song|album|playlist):(\d+)(?:\s+#.*)?$', re.I)
+
+
+def parse_catalog_line(s):
+    m = CATALOG_LINE.match(s)
+    return (m.group(1).lower(), m.group(2).lower(), m.group(3)) if m else None
+
+
+def new_hit(hid, title, subtitle='', detail=''):
+    return {'id': hid, 'title': title, 'subtitle': subtitle, 'detail': detail}
+
+
+def hit_line(h):
+    """The line added to the link box (the part after # is only a label for you)."""
+    return '%s # %s' % (h['id'], ('%s - %s' % (h['subtitle'], h['title'])) if h['subtitle'] else h['title'])
+
+
+class Throttle:
+    """Apple's free API allows roughly 20 requests a minute, so space the calls out."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def wait(self, interval):
+        import time
+        with self.lock:
+            gap = time.time() - self.last
+            if gap < interval:
+                time.sleep(interval - gap)
+            self.last = time.time()
+
+
+ITUNES_THROTTLE, DEEZER_THROTTLE = Throttle(), Throttle()
+
+
+def fetch_json(url, throttle, interval):
+    for attempt in range(2):
+        throttle.wait(interval if attempt == 0 else 2.5)
+        body = http_get(url)
+        if body:
+            try:
+                return json.loads(body.decode('utf-8', 'replace'))
+            except ValueError:
+                pass
+    return None
+
+
+def itunes_json(url):
+    return fetch_json(url, ITUNES_THROTTLE, 0.6)
+
+
+def deezer_json(url):
+    return fetch_json(url, DEEZER_THROTTLE, 0.25)
+
+
+def big_art(url):
+    return (url or '').replace('100x100bb', '1000x1000bb')
+
+
+def year_of(iso):
+    return iso[:4] if isinstance(iso, str) and len(iso) >= 4 else ''
+
+
+def itunes_track(r):
+    name = r.get('trackName')
+    if not name:
+        return None
+    return new_track(name, r.get('artistName') or '', r.get('trackTimeMillis') or 0, album=r.get('collectionName') or '',
+                     year=year_of(r.get('releaseDate')), art_url=big_art(r.get('artworkUrl100')),
+                     number=r.get('trackNumber') or 0, total=r.get('trackCount') or 0)
+
+
+def itunes_song_hits(j):
+    out = []
+    for r in j.get('results') or []:
+        t = itunes_track(r) if r.get('kind') == 'song' and r.get('trackId') else None
+        if not t:
+            continue
+        detail = ' · '.join(x for x in (t['album'], t['year']) if x)
+        if t['duration_ms'] > 0:
+            detail += (' · ' if detail else '') + '%d:%02d' % (t['duration_ms'] // 60000, (t['duration_ms'] // 1000) % 60)
+        out.append(new_hit('itunes:song:%d' % r['trackId'], t['title'], t['artist'], detail))
+    return out
+
+
+def itunes_album_hits(j):
+    out = []
+    for r in j.get('results') or []:
+        n = r.get('trackCount') or 0
+        if not r.get('collectionId') or not r.get('collectionName') or n <= 0:
+            continue
+        detail = ' · '.join(x for x in (year_of(r.get('releaseDate')), '%d song%s' % (n, '' if n == 1 else 's')) if x)
+        out.append(new_hit('itunes:album:%d' % r['collectionId'], r['collectionName'], r.get('artistName') or '', detail))
+    return out
+
+
+def itunes_artist_hits(j):
+    return [new_hit('itunes:artist:%d' % r['artistId'], r['artistName'], '', r.get('primaryGenreName') or '')
+            for r in j.get('results') or [] if r.get('artistId') and r.get('artistName')]
+
+
+def deezer_playlist_hits(j):
+    out = []
+    for r in j.get('data') or []:
+        if not r.get('id') or not r.get('title'):
+            continue
+        n = r.get('nb_tracks') or 0
+        out.append(new_hit('deezer:playlist:%d' % r['id'], r['title'], (r.get('user') or {}).get('name') or '', '%d song%s' % (n, '' if n == 1 else 's')))
+    return out
+
+
+def folded_album_name(s):
+    """"Abbey Road (Deluxe Edition)", "Abbey Road - Remastered" and "Abbey Road" are one album for our purposes."""
+    t = s.lower()
+    t = re.sub(r'\s*[\(\[].*?[\)\]]', '', t)
+    t = re.sub(r'\s+-\s+(single|ep)$', '', t)
+    t = re.sub(r'\b(deluxe|remastered|remaster|expanded|edition|version|bonus|anniversary|explicit)\b', '', t)
+    return re.sub(r'[\W_]+', ' ', t).strip()
+
+
+def folded_album_hits(j):
+    """An artist's albums: duplicate editions folded into one (the one with the most songs is kept), newest first."""
+    rows = [r for r in (j.get('results') or []) if r.get('wrapperType') == 'collection' and r.get('collectionId') and (r.get('trackCount') or 0) > 0]
+    best, order = {}, []
+    for r in rows:
+        key = folded_album_name(r.get('collectionName') or '')
+        if key in best:
+            if (r.get('trackCount') or 0) > (best[key].get('trackCount') or 0):
+                best[key] = r
+        else:
+            best[key] = r
+            order.append(key)
+    kept = sorted((best[k] for k in order), key=lambda r: r.get('releaseDate') or '', reverse=True)
+    return itunes_album_hits({'results': kept})
+
+
+def deezer_track(r):
+    if not r.get('title'):
+        return None
+    album = r.get('album') or {}
+    return new_track(r['title'], (r.get('artist') or {}).get('name') or '', (r.get('duration') or 0) * 1000,
+                     album=album.get('title') or '', art_url=album.get('cover_xl') or album.get('cover_big') or '')
+
+
+CATALOG_DOWN = {'itunes': "Apple's catalog did not answer. Try again in a moment.", 'deezer': 'Deezer did not answer. Try again in a moment.'}
+
+
+def search_catalog(kind, query):
+    """Returns (hits, error)."""
+    q = percent_encode_query(query)
+    if kind == 'playlist':
+        j = deezer_json('https://api.deezer.com/search/playlist?q=%s&limit=30' % q)
+        return (deezer_playlist_hits(j), '') if j is not None else ([], CATALOG_DOWN['deezer'])
+    entity, limit, fn = {'song': ('song', 30, itunes_song_hits), 'album': ('album', 30, itunes_album_hits)}.get(kind, ('musicArtist', 15, itunes_artist_hits))
+    j = itunes_json('https://itunes.apple.com/search?term=%s&entity=%s&limit=%d' % (q, entity, limit))
+    return (fn(j), '') if j is not None else ([], CATALOG_DOWN['itunes'])
+
+
+def artist_albums(artist_id):
+    j = itunes_json('https://itunes.apple.com/lookup?id=%s&entity=album&limit=200' % artist_id)
+    if j is None:
+        return [], CATALOG_DOWN['itunes']
+    hits = folded_album_hits(j)
+    return hits, ('' if hits else 'No albums found for this artist.')
+
+
+def fetch_catalog(ref):
+    """Turns ('itunes', 'album', '123') and friends into a list of songs with their tags. Returns (list or None, error)."""
+    source, kind, cid = ref
+    if (source, kind) == ('itunes', 'song'):
+        j = itunes_json('https://itunes.apple.com/lookup?id=%s' % cid)
+        t = itunes_track((j.get('results') or [{}])[0]) if j else None
+        return ({'name': t['title'], 'collection': False, 'tracks': [t]}, '') if t else (None, "Apple's catalog does not have that song")
+    if (source, kind) == ('itunes', 'album'):
+        j = itunes_json('https://itunes.apple.com/lookup?id=%s&entity=song&limit=200' % cid)
+        if j is None:
+            return None, "Apple's catalog did not answer"
+        rows = j.get('results') or []
+        name = next((r.get('collectionName') for r in rows if r.get('wrapperType') == 'collection'), 'Album')
+        songs = sorted((r for r in rows if r.get('kind') == 'song'), key=lambda r: (r.get('discNumber') or 1, r.get('trackNumber') or 0))
+        tracks = [t for t in (itunes_track(r) for r in songs) if t]
+        return ({'name': name, 'collection': True, 'tracks': tracks}, '') if tracks else (None, "That album has no songs in Apple's catalog")
+    if (source, kind) == ('deezer', 'playlist'):
+        meta = deezer_json('https://api.deezer.com/playlist/%s' % cid)
+        if not meta or not meta.get('title'):
+            return None, 'Deezer did not answer'
+        tracks, nxt = [], 'https://api.deezer.com/playlist/%s/tracks?limit=100' % cid
+        while nxt and len(tracks) < MAX_TRACKS:
+            page = deezer_json(nxt)
+            if not page:
+                break
+            tracks += [t for t in (deezer_track(r) for r in page.get('data') or []) if t]
+            nxt = page.get('next')
+        return ({'name': meta['title'], 'collection': True, 'tracks': tracks}, '') if tracks else (None, 'That playlist has no songs (it may be private)')
+    return None, 'Unsupported item'
 
 
 # ---------------------------------------------------------------- writing tags + cover art into an .m4a (no ffmpeg, standard library only)
@@ -677,12 +886,15 @@ def main(smoke=False, shot=None):
             pad = {'padx': 12, 'pady': 4}
             ttk.Label(self, text='Links (one per line)').pack(anchor='w', **pad)
             ttk.Label(self, foreground='#777777', wraplength=600, justify='left',
-                      text='Website links, or a Spotify song, album or playlist link. Spotify songs are always saved as audio (m4a) with title, artist, cover art and more written in. Each song is looked up on YouTube Music, then lyric videos, then music videos.').pack(anchor='w', padx=12)
+                      text='Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.').pack(anchor='w', padx=12)
             box = ttk.Frame(self)
             box.pack(fill='x', padx=12)
             self.links = tk.Text(box, height=5, wrap='none', undo=True)
             self.links.pack(side='left', fill='x', expand=True)
-            ttk.Button(box, text='Paste', command=self.paste).pack(side='left', padx=(8, 0), anchor='n')
+            side = ttk.Frame(box)
+            side.pack(side='left', padx=(8, 0), anchor='n')
+            ttk.Button(side, text='Paste', command=self.paste).pack(fill='x')
+            ttk.Button(side, text='Search...', command=self.search_dialog).pack(fill='x', pady=(4, 0))
 
             row = ttk.Frame(self)
             row.pack(fill='x', **pad)
@@ -692,7 +904,7 @@ def main(smoke=False, shot=None):
             self.height_box = ttk.Combobox(row, textvariable=self.height, values=HEIGHTS, width=6, state='readonly')
             self.height_box.pack(side='left', padx=(6, 16))
             ttk.Checkbutton(row, text='Whole playlist', variable=self.playlist).pack(side='left', padx=(0, 10))
-            ttk.Checkbutton(row, text='Choose Spotify songs', variable=self.ask_songs).pack(side='left', padx=(0, 16))
+            ttk.Checkbutton(row, text='Choose songs', variable=self.ask_songs).pack(side='left', padx=(0, 16))
             ttk.Label(row, text='Audio').pack(side='left')
             self.audio_box = ttk.Combobox(row, textvariable=self.audio_format, values=['m4a', 'best'], width=6, state='readonly')
             self.audio_box.pack(side='left', padx=(6, 0))
@@ -798,6 +1010,152 @@ def main(smoke=False, shot=None):
             self.go.configure(state='disabled')
             self.bar['value'] = 0
             self.dl.start(self.base, lines, self.mode.get(), self.height.get(), folder, self.playlist.get(), self.js, self.ffmpeg, self.audio_format.get(), self.ask_songs.get())
+
+        def add_links(self, lines):
+            cur = self.links.get('1.0', 'end-1c')
+            self.links.insert('end', ('' if not cur or cur.endswith('\n') else '\n') + '\n'.join(lines) + '\n')
+
+        def search_dialog(self):
+            """Look up songs, albums, artists or playlists and add them to the link box."""
+            win = tk.Toplevel(self)
+            win.title('Search music')
+            win.geometry('680x560')
+            win.transient(self)
+            kinds = {'Songs': 'song', 'Albums': 'album', 'Artists': 'artist', 'Playlists': 'playlist'}
+            st = {'hits': [], 'artist': None, 'artist_hits': [], 'busy': False}
+            inbox = queue.Queue()
+            top = ttk.Frame(win)
+            top.pack(fill='x', padx=12, pady=(12, 4))
+            kind_var, query_var = tk.StringVar(value='Songs'), tk.StringVar()
+            kind_box = ttk.Combobox(top, textvariable=kind_var, values=list(kinds), width=10, state='readonly')
+            kind_box.pack(side='left')
+            entry = ttk.Entry(top, textvariable=query_var)
+            entry.pack(side='left', fill='x', expand=True, padx=6)
+            search_btn = ttk.Button(top, text='Search')
+            search_btn.pack(side='left')
+            head = ttk.Label(win, font=('TkDefaultFont', 11, 'bold'))
+            head.pack(anchor='w', padx=12)
+            msg = ttk.Label(win, foreground='#777777', wraplength=640, justify='left')
+            msg.pack(anchor='w', padx=12)
+            frame = ttk.Frame(win)
+            frame.pack(fill='both', expand=True, padx=12, pady=6)
+            tree = ttk.Treeview(frame, columns=('title', 'detail'), show='headings', selectmode='extended')
+            tree.heading('title', text='Title')
+            tree.heading('detail', text='Details')
+            tree.column('title', width=360)
+            tree.column('detail', width=240)
+            sb = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
+            tree.configure(yscrollcommand=sb.set)
+            tree.pack(side='left', fill='both', expand=True)
+            sb.pack(side='left', fill='y')
+            bar = ttk.Frame(win)
+            bar.pack(fill='x', padx=12, pady=(0, 12))
+            back_btn = ttk.Button(bar, text='< Back to artists')
+            albums_btn = ttk.Button(bar, text='Show albums')
+            all_btn = ttk.Button(bar, text='Select all')
+            add_btn = ttk.Button(bar, text='Add')
+            close_btn = ttk.Button(bar, text='Close', command=win.destroy)
+            foot = ttk.Label(bar, foreground='#777777')
+            foot.pack(side='left')
+            close_btn.pack(side='right')
+            add_btn.pack(side='right', padx=6)
+            all_btn.pack(side='right')
+            albums_btn.pack(side='right', padx=6)
+            back_btn.pack(side='right')
+
+            def label_of(h):
+                return ('%s  -  %s' % (h['title'], h['subtitle'])) if h['subtitle'] else h['title']
+
+            def refresh_mode():
+                kind = kinds[kind_var.get()]
+                browsing_artists = kind == 'artist' and st['artist'] is None
+                in_albums = st['artist'] is not None
+                back_btn.configure(state='normal' if in_albums else 'disabled')
+                albums_btn.configure(state='normal' if browsing_artists else 'disabled')
+                all_btn.configure(state='disabled' if browsing_artists else 'normal')
+                add_btn.configure(state='disabled' if browsing_artists else 'normal')
+                head.configure(text=('Albums by %s' % st['artist']['title']) if in_albums else '')
+                top_state = 'disabled' if in_albums else 'normal'
+                for w in (kind_box, entry, search_btn):
+                    w.configure(state=('readonly' if (w is kind_box and top_state == 'normal') else top_state))
+                foot.configure(text='Playlists come from Deezer; the rest from Apple\'s free catalog.' if kinds[kind_var.get()] == 'playlist' else 'Songs, albums and artists come from Apple\'s free catalog.')
+
+            def fill(hits, select_all=False):
+                st['hits'] = hits
+                tree.delete(*tree.get_children())
+                for i, h in enumerate(hits):
+                    tree.insert('', 'end', iid=str(i), values=(label_of(h), h['detail']))
+                if select_all and hits:
+                    tree.selection_set(tree.get_children())
+
+            def run_in_background(fn, tag):
+                if st['busy']:
+                    return
+                st['busy'] = True
+                msg.configure(text='Searching...')
+                threading.Thread(target=lambda: inbox.put((tag, fn())), daemon=True).start()
+
+            def do_search(_e=None):
+                q = query_var.get().strip()
+                if not q:
+                    return
+                kind = kinds[kind_var.get()]
+                st['artist'] = None
+                run_in_background(lambda: search_catalog(kind, q), 'hits')
+
+            def show_albums(_e=None):
+                sel = tree.selection()
+                if kinds[kind_var.get()] != 'artist' or st['artist'] is not None or not sel:
+                    return
+                hit = st['hits'][int(sel[0])]
+                st['artist_hits'], st['pending_artist'] = st['hits'], hit
+                run_in_background(lambda: artist_albums(hit['id'].split(':')[-1]), 'albums')
+
+            def back():
+                st['artist'] = None
+                fill(st['artist_hits'])
+                msg.configure(text='')
+                refresh_mode()
+
+            def add_selected():
+                lines = [hit_line(st['hits'][int(i)]) for i in tree.selection()]
+                if not lines:
+                    return
+                self.add_links(lines)
+                tree.selection_remove(tree.selection())
+                msg.configure(text='Added %d. They are now in the link box.' % len(lines))
+
+            def pump():
+                try:
+                    while True:
+                        tag, (hits, err) = inbox.get_nowait()
+                        st['busy'] = False
+                        if tag == 'hits':
+                            fill(hits)
+                            msg.configure(text=err or ('' if hits else 'Nothing found. Try fewer words or another spelling.'))
+                        elif hits:
+                            st['artist'] = st['pending_artist']
+                            fill(hits, select_all=True)
+                            msg.configure(text="Duplicate editions (Deluxe, Remastered...) are folded into one. Untick what you do not want.")
+                        else:
+                            msg.configure(text=err)
+                        refresh_mode()
+                except queue.Empty:
+                    pass
+                if win.winfo_exists():
+                    win.after(100, pump)
+
+            search_btn.configure(command=do_search)
+            entry.bind('<Return>', do_search)
+            kind_box.bind('<<ComboboxSelected>>', lambda e: (fill([]), msg.configure(text=''), refresh_mode()))
+            back_btn.configure(command=back)
+            albums_btn.configure(command=show_albums)
+            all_btn.configure(command=lambda: tree.selection_set(tree.get_children()))
+            add_btn.configure(command=add_selected)
+            tree.bind('<Double-1>', show_albums)
+            refresh_mode()
+            pump()
+            entry.focus_set()
 
         def choose_dialog(self, name, tracks, reply):
             """A window listing the songs of an album or playlist; the user ticks the ones to download."""
@@ -997,6 +1355,53 @@ def selftest():
     eq([j['label'] for j in jobs], ['https://a.com/v'], 'plan keeps plain links only')
     eq(len(logs), 2, 'plan explains skipped lines')
 
+
+    # music search (Apple / Deezer)
+    eq(parse_catalog_line('itunes:album:1441164426 # The Beatles - Abbey Road'), ('itunes', 'album', '1441164426'), 'album line')
+    eq(parse_catalog_line('ITUNES:SONG:55'), ('itunes', 'song', '55'), 'song line, any case')
+    eq(parse_catalog_line('deezer:playlist:9 #x'), ('deezer', 'playlist', '9'), 'playlist line')
+    eq(parse_catalog_line('itunes:artist:1'), None, 'artist lines are only for browsing')
+    eq(parse_catalog_line('https://itunes:album:1'), None, 'must start the line')
+    eq(parse_catalog_line('itunes:album:12x'), None, 'id is digits only')
+    eq(big_art('https://x/100x100bb.jpg'), 'https://x/1000x1000bb.jpg', '1000 px art')
+    song = {'kind': 'song', 'trackId': 11, 'trackName': 'Chazak!', 'artistName': 'Avraham Fried', 'collectionName': 'Chazak!', 'trackNumber': 1, 'trackCount': 11,
+            'trackTimeMillis': 269000, 'releaseDate': '2010-01-01T08:00:00Z', 'artworkUrl100': 'https://x/100x100bb.jpg'}
+    tk_ = itunes_track(song)
+    eq((tk_['title'], tk_['number'], tk_['total'], tk_['year'], tk_['art_url'], tk_['duration_ms']), ('Chazak!', 1, 11, '2010', 'https://x/1000x1000bb.jpg', 269000), 'song fields')
+    sh = itunes_song_hits({'results': [song, {'kind': 'music-video', 'trackId': 12, 'trackName': 'v'}, {'wrapperType': 'artist'}]})
+    eq(len(sh), 1, 'only songs in song hits')
+    eq(hit_line(sh[0]), 'itunes:song:11 # Avraham Fried - Chazak!', 'song line label')
+    eq(sh[0]['detail'], 'Chazak! · 2010 · 4:29', 'song detail')
+    albums = {'results': [
+        {'wrapperType': 'artist', 'artistName': 'Queen'},
+        {'wrapperType': 'collection', 'collectionId': 1, 'collectionName': 'Abbey Road', 'artistName': 'The Beatles', 'trackCount': 17, 'releaseDate': '1969-09-26T07:00:00Z'},
+        {'wrapperType': 'collection', 'collectionId': 2, 'collectionName': 'Abbey Road (Deluxe Edition)', 'artistName': 'The Beatles', 'trackCount': 40, 'releaseDate': '2019-09-27T07:00:00Z'},
+        {'wrapperType': 'collection', 'collectionId': 3, 'collectionName': 'Abbey Road - Remastered', 'artistName': 'The Beatles', 'trackCount': 17, 'releaseDate': '2009-09-09T07:00:00Z'},
+        {'wrapperType': 'collection', 'collectionId': 4, 'collectionName': 'Help! - EP', 'artistName': 'The Beatles', 'trackCount': 4, 'releaseDate': '1965-08-06T07:00:00Z'},
+        {'wrapperType': 'collection', 'collectionId': 5, 'collectionName': 'Empty', 'artistName': 'The Beatles', 'trackCount': 0, 'releaseDate': '1970-01-01T07:00:00Z'}]}
+    eq([h['id'] for h in folded_album_hits(albums)], ['itunes:album:2', 'itunes:album:4'], 'editions folded (largest kept), empty dropped, newest first')
+    eq(folded_album_name('Abbey Road (Remastered 2009)'), 'abbey road', 'fold brackets')
+    eq(folded_album_name('Abbey Road - Single'), 'abbey road', 'fold single suffix')
+    eq(folded_album_name('Hineni'), 'hineni', 'plain name')
+    eq(folded_album_name('שיר'), 'שיר', 'Hebrew letters are kept')
+    pl = deezer_playlist_hits({'data': [{'id': 5, 'title': 'Jewish Wedding Dance', 'nb_tracks': 5, 'user': {'name': 'DJ'}}, {'title': 'no id'}]})
+    eq((len(pl), hit_line(pl[0]), pl[0]['detail']), (1, 'deezer:playlist:5 # DJ - Jewish Wedding Dance', '5 songs'), 'playlist hit')
+    dt = deezer_track({'title': 'Dance', 'duration': 200, 'artist': {'name': 'Band'}, 'album': {'title': 'LP', 'cover_xl': 'https://x/xl.jpg'}})
+    eq((dt['duration_ms'], dt['album'], dt['art_url']), (200000, 'LP', 'https://x/xl.jpg'), 'deezer track')
+    eq(itunes_artist_hits({'results': [{'artistId': 9, 'artistName': 'ישי ריבו', 'primaryGenreName': 'Pop'}]})[0]['id'], 'itunes:artist:9', 'artist hit')
+    # catalog lines flow through the planner (with the network faked)
+    real_fc = fetch_catalog
+    alb = {'name': 'Abbey Road', 'collection': True, 'tracks': [new_track('A', 'B', 1000, album='Abbey Road', number=1, total=3), new_track('C', 'B', 2000, album='Abbey Road', number=2, total=3), new_track('D', 'B', 3000, album='Abbey Road', number=3, total=3)]}
+    globals()['fetch_catalog'] = lambda ref: (alb, '') if ref == ('itunes', 'album', '77') else (None, 'nope')
+    try:
+        jobs = plan_jobs(['itunes:album:77 # B - Abbey Road'], '/base', lambda m: None, lambda lst: [2, 0])
+        eq([j['label'] for j in jobs], ['B - A', 'B - D'], 'catalog album: only the chosen songs')
+        eq(jobs[0]['folder'], os.path.join('/base', 'Abbey Road'), 'album goes into its own folder')
+        logs2 = []
+        eq(plan_jobs(['itunes:album:99'], '/base', logs2.append), [], 'unknown album gives no jobs')
+        eq(len(logs2), 1, 'unknown album is explained')
+    finally:
+        globals()['fetch_catalog'] = real_fc
     # picking songs from an album
     real_fetch = fetch_spotify
     fake = {'name': 'Abbey Road', 'collection': True, 'tracks': [new_track('A', 'B', 1000), new_track('C', 'B', 2000), new_track('D', 'B', 3000)]}
@@ -1061,6 +1466,18 @@ def selftest():
 if __name__ == '__main__':
     if '--selftest' in sys.argv:
         sys.exit(0 if selftest() else 1)
+    if '--search' in sys.argv:   # --search <song|album|artist|playlist> <words...> [--albums]   (prints the results; opens no window)
+        a = sys.argv[sys.argv.index('--search') + 1:]
+        kind, words = a[0], [w for w in a[1:] if w != '--albums']
+        hits, err = search_catalog(kind, ' '.join(words))
+        if kind == 'artist' and hits and '--albums' in sys.argv:
+            print('artist: ' + hits[0]['title'])
+            hits, err = artist_albums(hits[0]['id'].split(':')[-1])
+        if err:
+            print('error: ' + err)
+        for h in hits:
+            print(' | '.join((h['id'], h['title'], h['subtitle'], h['detail'])))
+        sys.exit(0)
     if '--download' in sys.argv:   # headless check: python3 yt_gui.py --download <url> <folder> <audio|video>
         a = [x for x in sys.argv[sys.argv.index('--download') + 1:] if x != '--tiers' and ',' not in x and x not in [k for k, _ in SOURCES]] if '--tiers' in sys.argv else sys.argv[sys.argv.index('--download') + 1:]
         q = queue.Queue()

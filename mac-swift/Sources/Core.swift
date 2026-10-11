@@ -391,6 +391,9 @@ func selfTest() -> Bool {
     eq(watchLinks(fromListing: listing), ["https://www.youtube.com/watch?v=BSTsnWoslP4", "https://www.youtube.com/watch?v=646p-BvYvpg"], "only song links, no artists/albums, no repeats")
     eq(watchLinks(fromListing: listing, limit: 1).count, 1, "limit")
     eq(SearchSource.allCases.map { $0.label }, ["YT Music", "lyric video", "official video", "music video", "top result"], "search order")
+    catalogSelfTest { a, b, m in
+        if "\(a)" == "\(b)" { passed += 1 } else { failed += 1; print("FAIL \(m): \(a) != \(b)") }
+    }
     print("\(passed) passed, \(failed) failed")
     return failed == 0
 }

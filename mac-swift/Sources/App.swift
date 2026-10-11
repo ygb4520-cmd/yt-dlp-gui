@@ -119,6 +119,7 @@ final class Model: ObservableObject {
 struct ContentView: View {
     @StateObject private var model = Model()
     @State private var links = ""
+    @State private var showSearch = false
     @AppStorage("mode") private var mode = "video"
     @AppStorage("height") private var height = "720"
     @AppStorage("audioFormat") private var audioFormat = "m4a"
@@ -131,16 +132,24 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Links (one per line)").font(.headline)
-            Text("Website links, or a Spotify song, album or playlist link. Spotify songs are always saved as audio (m4a) with title, artist, cover art and more written in, each one searched on YouTube.").font(.footnote).foregroundColor(.secondary)
+            Text("Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.").font(.footnote).foregroundColor(.secondary)
             HStack(alignment: .top) {
                 TextEditor(text: $links)
                     .font(.system(.body, design: .monospaced))
                     .frame(height: 90)
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.4)))
-                Button("Paste") {
-                    if let s = NSPasteboard.general.string(forType: .string) {
-                        links += (links.isEmpty || links.hasSuffix("\n") ? "" : "\n") + s.trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+                VStack {
+                    Button("Paste") {
+                        if let s = NSPasteboard.general.string(forType: .string) {
+                            links += (links.isEmpty || links.hasSuffix("\n") ? "" : "\n") + s.trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+                        }
                     }
+                    Button("Search...") { showSearch = true }
+                }
+                .sheet(isPresented: $showSearch) {
+                    SearchSheet(add: { lines in
+                        links += (links.isEmpty || links.hasSuffix("\n") ? "" : "\n") + lines.joined(separator: "\n") + "\n"
+                    }, close: { showSearch = false })
                 }
             }
 
@@ -164,7 +173,7 @@ struct ContentView: View {
                 .frame(width: 250)
                 .disabled(!audio)
                 Toggle("Whole playlist", isOn: $playlist)
-                Toggle("Choose Spotify songs", isOn: $askSongs)
+                Toggle("Choose songs", isOn: $askSongs)
                 Spacer()
             }
 

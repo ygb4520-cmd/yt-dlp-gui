@@ -7,6 +7,18 @@ let args = CommandLine.arguments
 if args.contains("--selftest") {
     exit(selfTest() ? 0 : 1)
 }
+if let i = args.firstIndex(of: "--search"), args.count > i + 2 {   // --search <song|album|artist|playlist> <words...>   (prints the results; opens no window)
+    let kind = args[i + 1]
+    let query = args[(i + 2)...].filter { $0 != "--albums" }.joined(separator: " ")
+    var res = searchCatalog(kind: kind, query: query)
+    if kind == "artist", let first = res.hits.first, args.contains("--albums") {   // also list the first artist's albums
+        print("artist: \(first.title)")
+        res = artistAlbums(artistID: String(first.id.split(separator: ":").last ?? ""))
+    }
+    if !res.error.isEmpty { print("error: \(res.error)") }
+    for h in res.hits { print("\(h.id) | \(h.title) | \(h.subtitle) | \(h.detail)") }
+    exit(0)
+}
 if let i = args.firstIndex(of: "--readtags"), args.count > i + 1 {
     printTags(path: args[i + 1])
     exit(0)
