@@ -87,7 +87,7 @@ final class Runner {
     }
 
     func run(base: String, jobs: [Job], audio: Bool, height: String, playlist: Bool,
-             js: (String, String)?, ffmpeg: String?, report: @escaping (JobEvent) -> Void) {
+             js: (String, String)?, ffmpeg: String?, audioFormat: String = "m4a", report: @escaping (JobEvent) -> Void) {
         lock.lock(); cancelledFlag = false; lock.unlock()
         for (i, job) in jobs.enumerated() {
             if cancelled { report(.row(i, "Cancelled")); continue }
@@ -96,7 +96,7 @@ final class Runner {
             switch job.target {
             case .link(let url):
                 let r = runOne(base: base, i: i, report: report, args: buildArguments(url: url, audio: audio, height: height, folder: job.folder,
-                                                                                     playlist: playlist, js: js, ffmpeg: ffmpeg))
+                                                                                     playlist: playlist, js: js, ffmpeg: ffmpeg, audioFormat: audioFormat))
                 if cancelled {
                     report(.row(i, "Cancelled"))
                 } else if r.code == 0 {
@@ -108,19 +108,29 @@ final class Runner {
                     report(.log("\(url)\n  \(why)"))
                 }
             case .track(let t):
-                var r = runOne(base: base, i: i, report: report, args: buildTrackArguments(track: t, strict: true, audio: audio, height: height,
-                                                                                          folder: job.folder, js: js, ffmpeg: ffmpeg))
+                // Spotify songs are always saved as audio (m4a, so the tags and cover art can be written)
+                var r = runOne(base: base, i: i, report: report, args: buildTrackArguments(track: t, strict: true, folder: job.folder, js: js, ffmpeg: ffmpeg))
                 var lengthDiffers = false
                 if r.file == nil && !cancelled && t.durationMs > 0 {   // nothing within a few seconds of Spotify's length: take the top result
                     report(.row(i, "Trying top result..."))
-                    r = runOne(base: base, i: i, report: report, args: buildTrackArguments(track: t, strict: false, audio: audio, height: height,
-                                                                                         folder: job.folder, js: js, ffmpeg: ffmpeg))
+                    r = runOne(base: base, i: i, report: report, args: buildTrackArguments(track: t, strict: false, folder: job.folder, js: js, ffmpeg: ffmpeg))
                     lengthDiffers = r.file != nil
                 }
                 if cancelled {
                     report(.row(i, "Cancelled"))
-                } else if r.file != nil {
-                    report(.row(i, lengthDiffers ? "Done (length differs)" : "Done"))
+                } else if let path = r.file {
+                    var status = lengthDiffers ? "Done (length differs)" : "Done"
+                    if path.lowercased().hasSuffix(".m4a") {
+                        report(.row(i, "Adding tags..."))
+                        if let note = tagM4A(path: path, track: enrichTrack(t)) {
+                            if status == "Done" { status = "Done (tags: see log)" }
+                            report(.log("\(job.label)\n  \(note)"))
+                        }
+                    } else {
+                        if status == "Done" { status = "Done (no tags)" }
+                        report(.log("\(job.label)\n  Saved as \((path as NSString).pathExtension), which cannot hold tags."))
+                    }
+                    report(.row(i, status))
                 } else {
                     report(.row(i, "Failed"))
                     report(.log("\(job.label)\n  \(r.error.isEmpty ? "No match found on YouTube." : r.error)"))

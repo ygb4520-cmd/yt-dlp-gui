@@ -39,7 +39,7 @@ final class Model: ObservableObject {
 
     func cancel() { runner.cancel() }
 
-    func start(links: String, audio: Bool, height: String, folder: String, playlist: Bool) {
+    func start(links: String, audio: Bool, height: String, folder: String, playlist: Bool, audioFormat: String) {
         guard !busy else { return }
         guard let base = ytdlp else { addLog("yt-dlp was not found."); return }
         let lines = links.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -58,7 +58,7 @@ final class Model: ObservableObject {
             let jobs = planJobs(lines: lines, baseFolder: dir) { text in DispatchQueue.main.async { self.addLog(text) } }
             DispatchQueue.main.async { self.apply(.plan(jobs.map { $0.label })) }
             if jobs.isEmpty { DispatchQueue.main.async { self.apply(.finished) }; return }
-            runner.run(base: base, jobs: jobs, audio: audio, height: height, playlist: playlist, js: js, ffmpeg: ffmpeg) { ev in
+            runner.run(base: base, jobs: jobs, audio: audio, height: height, playlist: playlist, js: js, ffmpeg: ffmpeg, audioFormat: audioFormat) { ev in
                 DispatchQueue.main.async { self.apply(ev) }
             }
         }
@@ -92,6 +92,7 @@ struct ContentView: View {
     @State private var links = ""
     @AppStorage("mode") private var mode = "video"
     @AppStorage("height") private var height = "720"
+    @AppStorage("audioFormat") private var audioFormat = "m4a"
     @AppStorage("playlist") private var playlist = false
     @AppStorage("folder") private var folder = defaultFolder
 
@@ -100,7 +101,7 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Links (one per line)").font(.headline)
-            Text("Website links, or a Spotify song, album or playlist link (each song is searched on YouTube).").font(.footnote).foregroundColor(.secondary)
+            Text("Website links, or a Spotify song, album or playlist link. Spotify songs are always saved as audio (m4a) with title, artist, cover art and more written in, each one searched on YouTube.").font(.footnote).foregroundColor(.secondary)
             HStack(alignment: .top) {
                 TextEditor(text: $links)
                     .font(.system(.body, design: .monospaced))
@@ -126,6 +127,12 @@ struct ContentView: View {
                 }
                 .frame(width: 170)
                 .disabled(audio)
+                Picker("Audio", selection: $audioFormat) {
+                    Text("m4a (plays everywhere)").tag("m4a")
+                    Text("Best available").tag("best")
+                }
+                .frame(width: 250)
+                .disabled(!audio)
                 Toggle("Whole playlist", isOn: $playlist)
                 Spacer()
             }
@@ -144,7 +151,7 @@ struct ContentView: View {
             }
 
             HStack {
-                Button("Download") { model.start(links: links, audio: audio, height: height, folder: folder, playlist: playlist) }
+                Button("Download") { model.start(links: links, audio: audio, height: height, folder: folder, playlist: playlist, audioFormat: audioFormat) }
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(model.busy)
                 Button("Cancel") { model.cancel() }.disabled(!model.busy)
@@ -179,9 +186,9 @@ struct ContentView: View {
     }
 
     private var hint: String {
-        if audio { return "Audio is saved as it comes from the site (usually .m4a), with no conversion." }
+        if audio { return audioFormat == "best" ? "Best available: the highest-quality audio the site has, often .webm (opus). YouTube audio tops out around 130-160 kbps either way." : "m4a: plays on every device. YouTube audio tops out around 128-160 kbps, so this is close to the best there is." }
         if model.hasFFmpeg { return "ffmpeg found: video is joined from the best picture and sound, up to the height you choose." }
-        return "No ffmpeg: video is saved as one file with sound in it, the best single-file quality the site offers (on YouTube that is up to 360p)."
+        return "No ffmpeg: video is saved as one file with sound in it, the best single-file quality the site offers. On YouTube that is up to 360p, so a higher max height only helps on other sites."
     }
 
     private func color(for status: String) -> Color {

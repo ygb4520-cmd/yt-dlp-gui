@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -81,9 +82,9 @@ def find_ffmpeg():
     return None
 
 
-def format_for(mode, height, ffmpeg=None):
+def format_for(mode, height, ffmpeg=None, audio_format='m4a'):
     if mode == 'audio':
-        return 'bestaudio[ext=m4a]/bestaudio/best'
+        return 'bestaudio/best' if audio_format == 'best' else 'bestaudio[ext=m4a]/bestaudio/best'
     if ffmpeg:   # picture and sound are joined by ffmpeg
         if height == 'best':
             return 'bv*+ba/b'
@@ -97,14 +98,14 @@ NEEDS_FFMPEG = ('That site only offers the picture and the sound as separate str
                 'and joining them needs ffmpeg. Audio only still works without it.')
 
 
-def build_cmd(base, url, mode, height, folder, playlist, js, ffmpeg=None):
+def build_cmd(base, url, mode, height, folder, playlist, js, ffmpeg=None, audio_format='m4a'):
     cmd = list(base) + [
         '--newline', '--no-quiet', '--no-colors', '--windows-filenames',
         '-P', folder, '-o', '%(title).100s.%(ext)s',
         '--progress-template', 'download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s',
         '--print', 'after_move:FILE|%(filepath)s',
         '--yes-playlist' if playlist else '--no-playlist',
-        '-f', format_for(mode, height, ffmpeg)]
+        '-f', format_for(mode, height, ffmpeg, audio_format)]
     if ffmpeg and mode == 'video':
         cmd += ['--ffmpeg-location', ffmpeg, '--merge-output-format', 'mp4']
     elif mode == 'video':
@@ -146,17 +147,280 @@ def open_path(path, reveal=False):
         pass
 
 
+# ---------------------------------------------------------------- Spotify (song / album / playlist) -> search YouTube
+MAX_TRACKS = 200
+DURATION_SLACK = 10   # seconds either way when matching a YouTube result to the Spotify song
+SPOTIFY_LINKS = [re.compile(r'^https?://open\.spotify\.com/(?:intl-[a-z-]+/)?(track|album|playlist)/([A-Za-z0-9]{22})(?:[/?#].*)?$', re.I),
+                 re.compile(r'^spotify:(track|album|playlist):([A-Za-z0-9]{22})$', re.I)]
+SPOTIFY_ANY = re.compile(r'^(https?://([a-z0-9-]+\.)*(spotify\.com|spotify\.link)/|spotify:)', re.I)
+NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+
+
+def parse_spotify_link(s):
+    for rx in SPOTIFY_LINKS:
+        m = rx.match(s)
+        if m:
+            return m.group(1).lower(), m.group(2)
+    return None
+
+
+def is_spotify_address(s):
+    return bool(SPOTIFY_ANY.match(s))
+
+
+def new_track(title, artist, duration_ms, album='', year='', art_url='', number=0, total=0, spotify_id=''):
+    return {'title': title, 'artist': artist, 'duration_ms': duration_ms, 'album': album, 'year': year,
+            'art_url': art_url, 'number': number, 'total': total, 'spotify_id': spotify_id}
+
+
+def best_art_url(entity):
+    """The biggest cover image Spotify lists, upgraded to the 640 px version of the same picture when it is a 300 px one."""
+    imgs = (entity.get('visualIdentity') or {}).get('image') or []
+    imgs = [i for i in imgs if isinstance(i, dict) and i.get('url')]
+    if not imgs:
+        return ''
+    best = max(imgs, key=lambda i: i.get('maxWidth') or 0)
+    return best['url'].replace('ab67616d00001e02', 'ab67616d0000b273')
+
+
+def release_year(entity):
+    iso = (entity.get('releaseDate') or {}).get('isoString') or ''
+    return iso[:4] if len(iso) >= 4 else ''
+
+
+def spotify_entity(html):
+    m = NEXT_DATA.search(html)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))['props']['pageProps']['state']['data']['entity']
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def parse_spotify_entity(e):
+    name = e.get('name') or e.get('title') or 'Spotify'
+    if e.get('type') == 'track':
+        artists = ', '.join(a.get('name', '') for a in (e.get('artists') or []) if isinstance(a, dict) and a.get('name'))
+        t = new_track(name, artists, e.get('duration') or 0, year=release_year(e), art_url=best_art_url(e), spotify_id=e.get('id') or '')
+        return {'name': name, 'collection': False, 'tracks': [t]}
+    items = e.get('trackList') or []
+    is_album = e.get('type') == 'album'
+    art = best_art_url(e) if is_album else ''   # a playlist's picture is not a song's cover; those are looked up per song
+    tracks = []
+    for t in items:
+        title = t.get('title')
+        if not title:
+            continue
+        tracks.append(new_track(title, t.get('subtitle') or '', t.get('duration') or 0, album=name if is_album else '',
+                                art_url=art, spotify_id=(t.get('uri') or '').split(':')[-1]))
+    if is_album:
+        for i, t in enumerate(tracks):
+            t['number'], t['total'] = i + 1, len(tracks)
+    return {'name': name, 'collection': True, 'tracks': tracks} if tracks else None
+
+
+def safe_file_name(s):
+    t = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', ' ', s)
+    t = re.sub(r' +', ' ', t).strip('. ')
+    return (t or 'Spotify')[:120]
+
+
+def track_label(t):
+    return '%s - %s' % (t['artist'], t['title']) if t['artist'] else t['title']
+
+
+def build_track_cmd(base, track, strict, folder, js, ffmpeg=None):
+    """One song: search YouTube (audio only, m4a so the tags can be written). `strict` keeps only results whose
+    length is within a few seconds of Spotify's."""
+    out = safe_file_name(track_label(track)).replace('%', '%%') + '.%(ext)s'
+    cmd = build_cmd(base, 'x', 'audio', '720', folder, False, js, ffmpeg, 'm4a')[:-2]   # drop the trailing "-- x"
+    cmd[cmd.index('-o') + 1] = out
+    query = track_label(track).replace(' - ', ' ')
+    cmd += ['--max-downloads', '1']
+    if strict and track['duration_ms'] > 0:
+        d = int(round(track['duration_ms'] / 1000.0))
+        cmd += ['--match-filter', 'duration>=%d & duration<=%d' % (d - DURATION_SLACK, d + DURATION_SLACK)]
+        return cmd + ['--', 'ytsearch5:' + query]
+    return cmd + ['--', 'ytsearch1:' + query]
+
+
+def http_get(url, timeout=20):
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read() if r.status == 200 else None
+    except Exception:
+        return None
+
+
+def fetch_spotify(kind, sid):
+    body = http_get('https://open.spotify.com/embed/%s/%s' % (kind, sid), 30)
+    if body is None:
+        return None, 'Spotify did not answer'
+    ent = spotify_entity(body.decode('utf-8', 'replace'))
+    lst = parse_spotify_entity(ent) if ent else None
+    if not lst:
+        return None, 'Spotify did not list the songs (the playlist may be private or not available in your region)'
+    return lst, ''
+
+
+def enrich_track(t):
+    """Fills in the cover art and year from the song's own Spotify page when the list (a playlist) did not carry them."""
+    if t['art_url'] or not t['spotify_id']:
+        return t
+    lst, _ = fetch_spotify('track', t['spotify_id'])
+    if not lst:
+        return t
+    first = lst['tracks'][0]
+    r = dict(t)
+    r['art_url'] = first['art_url']
+    r['year'] = r['year'] or first['year']
+    return r
+
+
+def plan_jobs(lines, base_folder, log):
+    """Plain links stay as they are; Spotify links become one job per song."""
+    jobs, plain = [], 0
+    for line in lines:
+        ref = parse_spotify_link(line)
+        if ref:
+            lst, why = fetch_spotify(*ref)
+            if not lst:
+                log('%s\n  %s' % (line, why))
+                continue
+            folder = os.path.join(base_folder, safe_file_name(lst['name'])) if lst['collection'] else base_folder
+            tracks = lst['tracks']
+            if len(tracks) > MAX_TRACKS:
+                log('Only the first %d songs of "%s" are used.' % (MAX_TRACKS, lst['name']))
+                tracks = tracks[:MAX_TRACKS]
+            log('Spotify: "%s" has %d song%s. Searching YouTube for each one%s' % (
+                lst['name'], len(lst['tracks']), '' if len(lst['tracks']) == 1 else 's',
+                ', saving into a folder named after it.' if lst['collection'] else '.'))
+            jobs += [{'label': track_label(t), 'kind': 'track', 'track': t, 'folder': folder} for t in tracks]
+        elif is_spotify_address(line):
+            log('%s\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; '
+                'open the link in your browser and copy the song, album or playlist address.' % line)
+        elif valid_url(line):
+            plain += 1
+            if plain > MAX_LINKS:
+                if plain == MAX_LINKS + 1:
+                    log('Only the first %d plain links are used.' % MAX_LINKS)
+                continue
+            jobs.append({'label': line, 'kind': 'link', 'url': line, 'folder': base_folder})
+        else:
+            log('Skipped (not an http/https link): ' + line[:60])
+    return jobs
+
+
+# ---------------------------------------------------------------- writing tags + cover art into an .m4a (no ffmpeg, standard library only)
+def _box(kind, payload):
+    return struct.pack('>I4s', 8 + len(payload), kind) + payload
+
+
+def _data_atom(flags, payload):
+    return _box(b'data', struct.pack('>II', flags, 0) + payload)
+
+
+def _boxes(buf, start, end):
+    pos = start
+    while pos + 8 <= end:
+        size, kind = struct.unpack_from('>I4s', buf, pos)
+        hdr = 8
+        if size == 1:
+            size, hdr = struct.unpack_from('>Q', buf, pos + 8)[0], 16
+        elif size == 0:
+            size = end - pos
+        if size < hdr or pos + size > end:
+            raise ValueError('damaged file (bad box)')
+        yield kind, pos, pos + size, hdr
+        pos += size
+
+
+def _patch_offsets(buf, start, end, delta):
+    for kind, s, e, h in _boxes(buf, start, end):
+        if kind in (b'trak', b'mdia', b'minf', b'stbl'):
+            _patch_offsets(buf, s + h, e, delta)
+        elif kind in (b'stco', b'co64'):
+            wide = kind == b'co64'
+            fmt, step = ('>Q', 8) if wide else ('>I', 4)
+            n = struct.unpack_from('>I', buf, s + h + 4)[0]
+            for i in range(n):
+                off = s + h + 8 + step * i
+                struct.pack_into(fmt, buf, off, struct.unpack_from(fmt, buf, off)[0] + delta)
+
+
+def build_ilst(track, art):
+    def text(code, value):
+        return _box(code, _data_atom(1, value.encode('utf-8')))
+    items = [text(b'\xa9nam', track['title']), text(b'\xa9ART', track['artist'])]
+    if track['artist']:
+        items.append(text(b'aART', track['artist'].split(', ')[0]))
+    if track['album']:
+        items.append(text(b'\xa9alb', track['album']))
+    if track['year']:
+        items.append(text(b'\xa9day', track['year']))
+    if track['number'] > 0:
+        items.append(_box(b'trkn', _data_atom(0, struct.pack('>HHHH', 0, min(track['number'], 65535), min(track['total'], 65535), 0))))
+    if art:
+        items.append(_box(b'covr', _data_atom(14 if art[:2] == b'\x89P' else 13, art)))
+    return _box(b'ilst', b''.join(items))
+
+
+def tag_m4a_bytes(data, track, art=None):
+    """Returns the file with title/artist/album/year/track number/cover art written in. Raises ValueError if the file
+    is not a normal MP4 audio file."""
+    top = list(_boxes(data, 0, len(data)))
+    moov = [(s, e, h) for k, s, e, h in top if k == b'moov']
+    if not moov:
+        raise ValueError('no moov box')
+    ms, me, mh = moov[0]
+    mdat_after = any(k == b'mdat' and s > ms for k, s, e, h in top)
+    keep = b''.join(bytes(data[s:e]) for k, s, e, h in _boxes(data, ms + mh, me) if k != b'udta')
+    hdlr = _box(b'hdlr', b'\x00' * 8 + b'mdir' + b'appl' + b'\x00' * 8 + b'\x00')
+    payload = bytearray(keep + _box(b'udta', _box(b'meta', b'\x00\x00\x00\x00' + hdlr + build_ilst(track, art))))
+    delta = 8 + len(payload) - (me - ms)
+    if mdat_after and delta:
+        _patch_offsets(payload, 0, len(payload), delta)
+    return bytes(data[:ms]) + _box(b'moov', bytes(payload)) + bytes(data[me:])
+
+
+def tag_m4a(path, track):
+    """Tags the file in place. Returns None on success, or a short note (tags written but no cover, or why it failed)."""
+    track = enrich_track(track)
+    art, note = None, ''
+    if track['art_url']:
+        art = http_get(track['art_url'])
+        if not art or len(art) < 1000:
+            art, note = None, ' (cover art could not be downloaded)'
+    else:
+        note = ' (no cover art found)'
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        out = tag_m4a_bytes(data, track, art)
+        tmp = path + '.tagging'
+        with open(tmp, 'wb') as f:
+            f.write(out)
+        os.replace(tmp, path)
+    except (ValueError, OSError) as e:
+        return 'could not write tags: %s' % e
+    return ('tags written' + note) if note else None
+
+
 class Downloader:
-    """Runs the links one after another on a background thread and reports through a queue."""
+    """Plans the jobs (Spotify links become one job per song), then runs them one after another on a background thread
+    and reports through a queue."""
 
     def __init__(self, events):
         self.events = events
         self.proc = None
         self.cancelled = False
 
-    def start(self, base, urls, mode, height, folder, playlist, js, ffmpeg=None):
+    def start(self, base, lines, mode, height, folder, playlist, js, ffmpeg=None, audio_format='m4a'):
         self.cancelled = False
-        threading.Thread(target=self._run, args=(base, urls, mode, height, folder, playlist, js, ffmpeg), daemon=True).start()
+        threading.Thread(target=self._run, args=(base, lines, mode, height, folder, playlist, js, ffmpeg, audio_format), daemon=True).start()
 
     def stop(self):
         self.cancelled = True
@@ -167,42 +431,81 @@ class Downloader:
             except Exception:
                 pass
 
-    def _run(self, base, urls, mode, height, folder, playlist, js, ffmpeg=None):
+    def _log(self, text):
+        self.events.put(('log', text))
+
+    def _run_one(self, i, cmd):
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
-        for i, url in enumerate(urls):
+        err, last_file = '', None
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                         encoding='utf-8', errors='replace', creationflags=flags)
+            for raw in self.proc.stdout:
+                ev = parse_line(raw)
+                if not ev:
+                    continue
+                if ev[0] == 'prog':
+                    self.events.put(('prog', i, ev[1], ev[2], ev[3]))
+                elif ev[0] == 'file':
+                    last_file = ev[1]
+                    self.events.put(('file', i, last_file))
+                elif ev[0] == 'err':
+                    err = ev[1]
+            code = self.proc.wait()
+        except Exception as e:
+            return 1, 'could not run yt-dlp: %s' % e, None
+        return code, err, last_file
+
+    def _run(self, base, lines, mode, height, folder, playlist, js, ffmpeg, audio_format):
+        jobs = plan_jobs(lines, folder, self._log)
+        self.events.put(('plan', [j['label'] for j in jobs]))
+        for i, job in enumerate(jobs):
             if self.cancelled:
                 self.events.put(('row', i, 'Cancelled'))
                 continue
             self.events.put(('row', i, 'Starting...'))
-            err, last_file = '', ''
             try:
-                self.proc = subprocess.Popen(build_cmd(base, url, mode, height, folder, playlist, js, ffmpeg),
-                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                             encoding='utf-8', errors='replace', creationflags=flags)
-                for raw in self.proc.stdout:
-                    ev = parse_line(raw)
-                    if not ev:
-                        continue
-                    if ev[0] == 'prog':
-                        self.events.put(('prog', i, ev[1], ev[2], ev[3]))
-                    elif ev[0] == 'file':
-                        last_file = ev[1]
-                        self.events.put(('file', i, last_file))
-                    elif ev[0] == 'err':
-                        err = ev[1]
-                code = self.proc.wait()
-            except Exception as e:
-                code, err = 1, 'could not run yt-dlp: %s' % e
+                os.makedirs(job['folder'], exist_ok=True)
+            except OSError:
+                pass
+            if job['kind'] == 'link':
+                code, err, _ = self._run_one(i, build_cmd(base, job['url'], mode, height, job['folder'], playlist, js, ffmpeg, audio_format))
+                if self.cancelled:
+                    self.events.put(('row', i, 'Cancelled'))
+                elif code == 0:
+                    self.events.put(('row', i, 'Done'))
+                else:
+                    self.events.put(('row', i, 'Failed'))
+                    why = err or 'yt-dlp stopped with an error (exit code %s)' % code
+                    if mode == 'video' and not ffmpeg and 'Requested format is not available' in why:
+                        why = NEEDS_FFMPEG
+                    self._log('%s\n  %s' % (job['url'], why))
+                continue
+            # a Spotify song: always audio (m4a, so the tags and cover art can be written)
+            t = job['track']
+            code, err, path = self._run_one(i, build_track_cmd(base, t, True, job['folder'], js, ffmpeg))
+            differs = False
+            if not path and not self.cancelled and t['duration_ms'] > 0:   # nothing within a few seconds of Spotify's length: take the top result
+                self.events.put(('row', i, 'Trying top result...'))
+                code, err, path = self._run_one(i, build_track_cmd(base, t, False, job['folder'], js, ffmpeg))
+                differs = bool(path)
             if self.cancelled:
                 self.events.put(('row', i, 'Cancelled'))
-            elif code == 0:
-                self.events.put(('row', i, 'Done'))
+            elif path:
+                status = 'Done (length differs)' if differs else 'Done'
+                if path.lower().endswith('.m4a'):
+                    self.events.put(('row', i, 'Adding tags...'))
+                    note = tag_m4a(path, t)
+                    if note:
+                        status = 'Done (tags: see log)' if status == 'Done' else status
+                        self._log('%s\n  %s' % (job['label'], note))
+                else:
+                    status = 'Done (no tags)' if status == 'Done' else status
+                    self._log('%s\n  Saved as %s, which cannot hold tags.' % (job['label'], os.path.splitext(path)[1]))
+                self.events.put(('row', i, status))
             else:
                 self.events.put(('row', i, 'Failed'))
-                why = err or 'yt-dlp stopped with an error (exit code %s)' % code
-                if mode == 'video' and not ffmpeg and 'Requested format is not available' in why:
-                    why = NEEDS_FFMPEG
-                self.events.put(('log', '%s\n  %s' % (url, why)))
+                self._log('%s\n  %s' % (job['label'], err or 'No match found on YouTube.'))
         self.events.put(('finished',))
 
 
@@ -241,6 +544,7 @@ def main(smoke=False, shot=None):
             s = load_settings()
             self.mode = tk.StringVar(value=s.get('mode', 'video') if s.get('mode') in ('audio', 'video') else 'video')
             self.height = tk.StringVar(value=s.get('height', '720') if s.get('height') in HEIGHTS else '720')
+            self.audio_format = tk.StringVar(value=s.get('audio_format', 'm4a') if s.get('audio_format') in ('m4a', 'best') else 'm4a')
             self.playlist = tk.BooleanVar(value=bool(s.get('playlist', False)))
             self.folder = tk.StringVar(value=s.get('folder') or DEFAULT_FOLDER)
             self.build()
@@ -254,6 +558,8 @@ def main(smoke=False, shot=None):
         def build(self):
             pad = {'padx': 12, 'pady': 4}
             ttk.Label(self, text='Links (one per line)').pack(anchor='w', **pad)
+            ttk.Label(self, foreground='#777777', wraplength=600, justify='left',
+                      text='Website links, or a Spotify song, album or playlist link. Spotify songs are always saved as audio (m4a) with title, artist, cover art and more written in, each one searched on YouTube.').pack(anchor='w', padx=12)
             box = ttk.Frame(self)
             box.pack(fill='x', padx=12)
             self.links = tk.Text(box, height=5, wrap='none', undo=True)
@@ -267,7 +573,11 @@ def main(smoke=False, shot=None):
             ttk.Label(row, text='Max height').pack(side='left')
             self.height_box = ttk.Combobox(row, textvariable=self.height, values=HEIGHTS, width=6, state='readonly')
             self.height_box.pack(side='left', padx=(6, 16))
-            ttk.Checkbutton(row, text='Whole playlist', variable=self.playlist).pack(side='left')
+            ttk.Checkbutton(row, text='Whole playlist', variable=self.playlist).pack(side='left', padx=(0, 16))
+            ttk.Label(row, text='Audio').pack(side='left')
+            self.audio_box = ttk.Combobox(row, textvariable=self.audio_format, values=['m4a', 'best'], width=6, state='readonly')
+            self.audio_box.pack(side='left', padx=(6, 0))
+            self.audio_box.bind('<<ComboboxSelected>>', lambda e: self.mode_changed())
 
             self.hint = ttk.Label(self, foreground='#777777', wraplength=600, justify='left')
             self.hint.pack(anchor='w', padx=12)
@@ -305,12 +615,15 @@ def main(smoke=False, shot=None):
         def mode_changed(self):
             video = self.mode.get() == 'video'
             self.height_box.configure(state='readonly' if video else 'disabled')
+            self.audio_box.configure(state='disabled' if video else 'readonly')
             if not video:
-                msg = 'Audio is saved as it comes from the site (usually .m4a), with no conversion.'
+                msg = ('Audio "best": the highest-quality audio the site has, often .webm (opus). YouTube audio tops out around 130-160 kbps either way.'
+                       if self.audio_format.get() == 'best' else
+                       'Audio "m4a": plays on every device. YouTube audio tops out around 128-160 kbps, so this is close to the best there is.')
             elif self.ffmpeg:
                 msg = 'ffmpeg found: video is joined from the best picture and sound, up to the height you choose.'
             else:
-                msg = 'No ffmpeg: video is saved as one file with sound in it, the best single-file quality the site offers (on YouTube that is up to 360p).'
+                msg = 'No ffmpeg: video is saved as one file with sound in it, the best single-file quality the site offers On YouTube that is up to 360p, so a higher max height only helps on other sites.'
             self.hint.configure(text=msg)
 
         def notice(self, text):
@@ -349,41 +662,35 @@ def main(smoke=False, shot=None):
             if not self.base:
                 messagebox.showerror('yt-dlp', 'yt-dlp was not found. See the note at the bottom of the window.')
                 return
-            raw = [l.strip() for l in self.links.get('1.0', 'end').splitlines() if l.strip()]
-            urls = [u for u in raw if valid_url(u)]
-            bad = [u for u in raw if not valid_url(u)]
-            if bad:
-                self.write_log('Skipped (not an http/https link): ' + ', '.join(b[:60] for b in bad))
-            if not urls:
-                messagebox.showinfo('yt-dlp', 'Paste at least one link that starts with http:// or https://')
+            lines = [l.strip() for l in self.links.get('1.0', 'end').splitlines() if l.strip()]
+            if not lines:
+                messagebox.showinfo('yt-dlp', 'Paste at least one link (a website link or a Spotify song, album or playlist link)')
                 return
-            if len(urls) > MAX_LINKS:
-                self.write_log('Only the first %d links are used.' % MAX_LINKS)
-                urls = urls[:MAX_LINKS]
             folder = os.path.expanduser(self.folder.get().strip() or DEFAULT_FOLDER)
             try:
                 os.makedirs(folder, exist_ok=True)
             except OSError as e:
                 messagebox.showerror('Save to', 'Cannot use that folder: %s' % e)
                 return
-            save_settings({'mode': self.mode.get(), 'height': self.height.get(), 'playlist': self.playlist.get(), 'folder': folder})
+            save_settings({'mode': self.mode.get(), 'height': self.height.get(), 'audio_format': self.audio_format.get(), 'playlist': self.playlist.get(), 'folder': folder})
             self.tree.delete(*self.tree.get_children())
             self.files = {}
-            for i, u in enumerate(urls):
-                self.tree.insert('', 'end', iid=str(i), values=(u, 'Waiting'))
             self.busy = True
             self.go.configure(state='disabled')
             self.bar['value'] = 0
-            self.dl.start(self.base, urls, self.mode.get(), self.height.get(), folder, self.playlist.get(), self.js, self.ffmpeg)
+            self.dl.start(self.base, lines, self.mode.get(), self.height.get(), folder, self.playlist.get(), self.js, self.ffmpeg, self.audio_format.get())
 
         def poll(self):
             try:
                 while True:
                     ev = self.events.get_nowait()
-                    if ev[0] == 'row':
+                    if ev[0] == 'plan':
+                        for i, label in enumerate(ev[1]):
+                            self.tree.insert('', 'end', iid=str(i), values=(label, 'Waiting'))
+                    elif ev[0] == 'row':
                         self.tree.set(str(ev[1]), 'status', ev[2])
-                        if ev[2] in ('Done', 'Failed', 'Cancelled'):
-                            self.bar['value'] = 100 if ev[2] == 'Done' else 0
+                        if ev[2].startswith('Done') or ev[2] in ('Failed', 'Cancelled'):
+                            self.bar['value'] = 100 if ev[2].startswith('Done') else 0
                             self.speed.configure(text='')
                     elif ev[0] == 'prog':
                         self.bar['value'] = ev[2]
@@ -453,6 +760,85 @@ def selftest():
     eq(parse_line('ERROR: [youtube] x: Sign in to confirm')[0], 'err', 'error')
     eq(parse_line('[download] Destination: x') is None, True, 'other lines ignored')
     eq(parse_line('\x1b[0;32mPROG| 10.0%|1MiB/s|00:01\x1b[0m')[0], 'prog', 'ansi stripped')
+
+    # Spotify
+    eq(parse_spotify_link('https://open.spotify.com/track/3z8h0TU7ReDPLIbEnYhWZb?si=abc'), ('track', '3z8h0TU7ReDPLIbEnYhWZb'), 'track link')
+    eq(parse_spotify_link('https://open.spotify.com/intl-fr/album/0ETFjACtuP2ADo6LFhL6HN'), ('album', '0ETFjACtuP2ADo6LFhL6HN'), 'intl album link')
+    eq(parse_spotify_link('spotify:playlist:37i9dQZF1DXcBWIGoYBM5M'), ('playlist', '37i9dQZF1DXcBWIGoYBM5M'), 'uri')
+    eq(parse_spotify_link('https://open.spotify.com/artist/3z8h0TU7ReDPLIbEnYhWZb'), None, 'artist not supported')
+    eq(parse_spotify_link('https://evil.com/?u=https://open.spotify.com/track/3z8h0TU7ReDPLIbEnYhWZb'), None, 'must start with spotify')
+    eq(is_spotify_address('https://spotify.link/xyz'), True, 'spotify short link')
+    eq(is_spotify_address('https://notspotify.com/x'), False, 'lookalike host')
+    page = ('<html><script id="__NEXT_DATA__" type="application/json">' + json.dumps({'props': {'pageProps': {'state': {'data': {'entity': {
+        'type': 'album', 'name': 'Abbey Road', 'visualIdentity': {'image': [{'url': 'https://c/ab67616d00001e02abc', 'maxWidth': 300}, {'url': 'https://c/ab67616d00004851abc', 'maxWidth': 64}]},
+        'trackList': [{'title': 'Come Together', 'subtitle': 'The Beatles', 'duration': 259946, 'uri': 'spotify:track:2Eql'}, {'title': 'Something', 'subtitle': 'The Beatles', 'duration': 182000}, {'subtitle': 'no title'}]}}}}}}) + '</script></html>')
+    al = parse_spotify_entity(spotify_entity(page))
+    eq(al['name'], 'Abbey Road', 'album name')
+    eq(al['collection'], True, 'album is collection')
+    eq([t['title'] for t in al['tracks']], ['Come Together', 'Something'], 'album tracks')
+    eq([t['album'] for t in al['tracks']], ['Abbey Road', 'Abbey Road'], 'album on tracks')
+    eq([t['number'] for t in al['tracks']], [1, 2], 'track numbers')
+    eq(al['tracks'][0]['total'], 2, 'track total')
+    eq(al['tracks'][0]['art_url'], 'https://c/ab67616d0000b273abc', 'art upgraded to 640 px')
+    eq(al['tracks'][0]['spotify_id'], '2Eql', 'spotify id')
+    one = parse_spotify_entity({'type': 'track', 'name': 'Bohemian Rhapsody', 'duration': 354947, 'id': 'TID', 'artists': [{'name': 'Queen'}, {'name': 'Other'}],
+                                'releaseDate': {'isoString': '2018-10-19T00:00:00Z'}, 'visualIdentity': {'image': [{'url': 'https://c/ab67616d00001e02zz', 'maxWidth': 300}]}})
+    eq(one['tracks'][0], new_track('Bohemian Rhapsody', 'Queen, Other', 354947, '', '2018', 'https://c/ab67616d0000b273zz', 0, 0, 'TID'), 'single track')
+    pl = parse_spotify_entity({'type': 'playlist', 'name': 'Mix', 'visualIdentity': {'image': [{'url': 'https://c/ab67616d00001e02pp', 'maxWidth': 300}]},
+                               'trackList': [{'title': 'A', 'subtitle': 'B', 'duration': 1000, 'uri': 'spotify:track:XYZ'}]})
+    eq(pl['tracks'][0]['art_url'], '', 'playlist picture is not song art')
+    eq(pl['tracks'][0]['album'], '', 'no album name for playlist songs')
+    eq(spotify_entity('<html>nothing</html>') is None, True, 'no data page')
+    eq(parse_spotify_entity({'type': 'playlist', 'name': 'x', 'trackList': []}) is None, True, 'empty list')
+    eq(safe_file_name('AC/DC: Back In Black?'), 'AC DC Back In Black', 'safe name')
+    eq(safe_file_name('...'), 'Spotify', 'empty safe name')
+    t = new_track('100% Pure', 'Queen', 200000)
+    st = build_track_cmd(['y'], t, True, '/t', None)
+    eq(st[-2:], ['--', 'ytsearch5:Queen 100% Pure'], 'strict search query')
+    eq(st[st.index('--match-filter') + 1], 'duration>=190 & duration<=210', 'duration window')
+    eq(st[st.index('-o') + 1], 'Queen - 100%% Pure.%(ext)s', 'percent escaped in file name')
+    eq(st[st.index('-f') + 1], 'bestaudio[ext=m4a]/bestaudio/best', 'songs prefer m4a')
+    eq(build_track_cmd(['y'], t, False, '/t', None)[-2:], ['--', 'ytsearch1:Queen 100% Pure'], 'loose search')
+    eq('--match-filter' in build_track_cmd(['y'], t, False, '/t', None), False, 'no filter when loose')
+    eq(build_track_cmd(['y'], new_track('X', '', 0), True, '/t', None)[-2:], ['--', 'ytsearch1:X'], 'no length known')
+    eq(format_for('audio', '720', None, 'best'), 'bestaudio/best', 'best audio format')
+    logs = []
+    jobs = plan_jobs(['https://a.com/v', '--exec=bad', 'https://open.spotify.com/artist/3z8h0TU7ReDPLIbEnYhWZb'], '/base', logs.append)
+    eq([j['label'] for j in jobs], ['https://a.com/v'], 'plan keeps plain links only')
+    eq(len(logs), 2, 'plan explains skipped lines')
+
+    # tag writer on a synthetic MP4 (header first, audio data after it, with a chunk-offset table that must move)
+    def mp4(mdat_first):
+        mdat = _box(b'mdat', b'AUDIO-BYTES-' * 20)
+        def moov_for(off):
+            stbl = _box(b'stbl', _box(b'stco', struct.pack('>IIII', 0, 2, off, off + 50)))
+            trak = _box(b'trak', _box(b'mdia', _box(b'minf', stbl)))
+            return _box(b'moov', _box(b'mvhd', b'\x00' * 100) + trak + _box(b'udta', _box(b'free', b'old')))
+        ftyp = _box(b'ftyp', b'M4A \x00\x00\x00\x00M4A mp42isom')
+        if mdat_first:
+            return ftyp + mdat + moov_for(len(ftyp) + 8), len(ftyp) + 8
+        size = len(moov_for(0))
+        return ftyp + moov_for(len(ftyp) + size + 8) + mdat, len(ftyp) + size + 8
+    tr = new_track('Come Together', 'The Beatles', 259000, 'Abbey Road', '1969', '', 1, 17)
+    art = b'\xff\xd8\xff\xe0' + b'J' * 2000
+    for mdat_first in (False, True):
+        src, first_chunk = mp4(mdat_first)
+        out = tag_m4a_bytes(src, tr, art)
+        tops = {k: (s, e, h) for k, s, e, h in _boxes(out, 0, len(out))}
+        ms, me, mh = tops[b'moov']
+        eq(b'ilst' in out and b'Come Together' in out and b'Abbey Road' in out and b'\xa9day' in out and b'trkn' in out and b'covr' in out, True, 'tags present (mdat_first=%s)' % mdat_first)
+        eq(b'old' in out, False, 'old udta replaced')
+        eq(out[tops[b'mdat'][0]:tops[b'mdat'][1]], src[[s for k, s, e, h in _boxes(src, 0, len(src)) if k == b'mdat'][0]:[e for k, s, e, h in _boxes(src, 0, len(src)) if k == b'mdat'][0]], 'audio data untouched')
+        new_first = tops[b'mdat'][0] + 8
+        i = out.index(b'stco') + 4
+        _count, off1, off2 = struct.unpack_from('>III', out, i + 4)
+        eq((off1, off2), (new_first, new_first + 50), 'chunk offsets still point at the audio (mdat_first=%s)' % mdat_first)
+        eq(out[off1:off1 + 12], b'AUDIO-BYTES-', 'offset lands on the audio bytes')
+    try:
+        tag_m4a_bytes(b'not an mp4 file at all....', tr, None)
+        eq(True, False, 'non-mp4 should fail')
+    except ValueError:
+        eq(True, True, 'non-mp4 rejected')
     f = find_ytdlp()
     eq(f is None or isinstance(f, list), True, 'find_ytdlp type')
     ff = find_ffmpeg()
@@ -470,7 +856,7 @@ if __name__ == '__main__':
         a = sys.argv[sys.argv.index('--download') + 1:]
         q = queue.Queue()
         d = Downloader(q)
-        d.start(find_ytdlp(), [a[0]], a[2] if len(a) > 2 else 'video', '720', a[1], False, find_js(), find_ffmpeg())
+        d.start(find_ytdlp(), [a[0]], a[2] if len(a) > 2 else 'video', '720', a[1], False, find_js(), find_ffmpeg(), 'm4a')
         while True:
             ev = q.get()
             print(ev)

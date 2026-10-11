@@ -4,8 +4,8 @@ set -e
 cd "$(dirname "$0")"
 APP="build/yt-dlp GUI.app"
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -swift-version 5 -O -target arm64-apple-macos13.0 Sources/*.swift -o build/yt-dlp-gui-arm64
-swiftc -swift-version 5 -O -target x86_64-apple-macos13.0 Sources/*.swift -o build/yt-dlp-gui-x86_64
+swiftc -swift-version 5 -O -target arm64-apple-macos13.0 -framework AVFoundation -framework CoreMedia Sources/*.swift -o build/yt-dlp-gui-arm64
+swiftc -swift-version 5 -O -target x86_64-apple-macos13.0 -framework AVFoundation -framework CoreMedia Sources/*.swift -o build/yt-dlp-gui-x86_64
 lipo -create build/yt-dlp-gui-arm64 build/yt-dlp-gui-x86_64 -output "$APP/Contents/MacOS/yt-dlp-gui"
 rm build/yt-dlp-gui-arm64 build/yt-dlp-gui-x86_64
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # made by make_icon.swift + iconutil

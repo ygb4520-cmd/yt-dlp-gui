@@ -63,8 +63,8 @@ func findFFmpeg() -> String? {
     return searchPath("ffmpeg")
 }
 
-func formatFor(audio: Bool, height: String, ffmpeg: String?) -> String {
-    if audio { return "bestaudio[ext=m4a]/bestaudio/best" }
+func formatFor(audio: Bool, height: String, ffmpeg: String?, audioFormat: String = "m4a") -> String {
+    if audio { return audioFormat == "best" ? "bestaudio/best" : "bestaudio[ext=m4a]/bestaudio/best" }
     if ffmpeg != nil {   // picture and sound are joined by ffmpeg
         return height == "best" ? "bv*+ba/b" : "bv*[height<=\(height)]+ba/b[height<=\(height)]/b"
     }
@@ -72,13 +72,13 @@ func formatFor(audio: Bool, height: String, ffmpeg: String?) -> String {
 }
 
 private func commonArguments(audio: Bool, height: String, folder: String, playlist: Bool,
-                              js: (String, String)?, ffmpeg: String?, outTemplate: String) -> [String] {
+                              js: (String, String)?, ffmpeg: String?, outTemplate: String, audioFormat: String = "m4a") -> [String] {
     var a = ["--newline", "--no-quiet", "--no-colors", "--windows-filenames",
              "-P", folder, "-o", outTemplate,
              "--progress-template", "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
              "--print", "after_move:FILE|%(filepath)s",
              playlist ? "--yes-playlist" : "--no-playlist",
-             "-f", formatFor(audio: audio, height: height, ffmpeg: ffmpeg)]
+             "-f", formatFor(audio: audio, height: height, ffmpeg: ffmpeg, audioFormat: audioFormat)]
     if let ff = ffmpeg, !audio {
         a += ["--ffmpeg-location", ff, "--merge-output-format", "mp4"]
     } else if !audio {
@@ -90,15 +90,25 @@ private func commonArguments(audio: Bool, height: String, folder: String, playli
 }
 
 func buildArguments(url: String, audio: Bool, height: String, folder: String, playlist: Bool,
-                    js: (String, String)?, ffmpeg: String?) -> [String] {
+                    js: (String, String)?, ffmpeg: String?, audioFormat: String = "m4a") -> [String] {
     commonArguments(audio: audio, height: height, folder: folder, playlist: playlist, js: js, ffmpeg: ffmpeg,
-                    outTemplate: "%(title).100s.%(ext)s") + ["--", url]
+                    outTemplate: "%(title).100s.%(ext)s", audioFormat: audioFormat) + ["--", url]
 }
 
 // MARK: - Spotify links (song / album / playlist): read the song list, then search YouTube for each song
 
 struct SpotifyRef: Equatable { let kind: String; let id: String }
-struct Track: Equatable { let title: String; let artist: String; let durationMs: Int }
+struct Track: Equatable {
+    var title: String
+    var artist: String
+    var durationMs: Int
+    var album = ""
+    var year = ""
+    var artURL = ""
+    var number = 0          // position in the album (0 = unknown)
+    var total = 0
+    var spotifyID = ""
+}
 struct SpotifyList: Equatable { let name: String; let isCollection: Bool; let tracks: [Track] }
 
 let maxTracks = 200
@@ -127,18 +137,39 @@ func spotifyEntity(fromHTML html: String) -> [String: Any]? {
     return entity
 }
 
+/// The biggest cover image Spotify lists, upgraded to the 640 px version of the same picture when it is a 300 px one.
+func bestArtURL(_ entity: [String: Any]) -> String {
+    guard let vi = entity["visualIdentity"] as? [String: Any], let imgs = vi["image"] as? [[String: Any]] else { return "" }
+    let best = imgs.max { ((($0["maxWidth"] as? Int) ?? 0) < (($1["maxWidth"] as? Int) ?? 0)) }
+    let url = (best?["url"] as? String) ?? ""
+    return url.replacingOccurrences(of: "ab67616d00001e02", with: "ab67616d0000b273")
+}
+
+func releaseYear(_ entity: [String: Any]) -> String {
+    guard let d = entity["releaseDate"] as? [String: Any], let iso = d["isoString"] as? String, iso.count >= 4 else { return "" }
+    return String(iso.prefix(4))
+}
+
 func parseSpotifyEntity(_ e: [String: Any]) -> SpotifyList? {
     let name = (e["name"] as? String) ?? (e["title"] as? String) ?? "Spotify"
     if (e["type"] as? String) == "track" {
         let artists = ((e["artists"] as? [[String: Any]]) ?? []).compactMap { $0["name"] as? String }.joined(separator: ", ")
         guard !name.isEmpty else { return nil }
-        return SpotifyList(name: name, isCollection: false, tracks: [Track(title: name, artist: artists, durationMs: (e["duration"] as? Int) ?? 0)])
+        let t = Track(title: name, artist: artists, durationMs: (e["duration"] as? Int) ?? 0, year: releaseYear(e),
+                      artURL: bestArtURL(e), spotifyID: (e["id"] as? String) ?? "")
+        return SpotifyList(name: name, isCollection: false, tracks: [t])
     }
     guard let list = e["trackList"] as? [[String: Any]], !list.isEmpty else { return nil }
-    let tracks = list.compactMap { t -> Track? in
-        guard let title = t["title"] as? String, !title.isEmpty else { return nil }
-        return Track(title: title, artist: (t["subtitle"] as? String) ?? "", durationMs: (t["duration"] as? Int) ?? 0)
+    let isAlbum = (e["type"] as? String) == "album"
+    let art = isAlbum ? bestArtURL(e) : ""   // a playlist's picture is not a song's cover; those are looked up per song
+    var tracks: [Track] = []
+    for t in list {
+        guard let title = t["title"] as? String, !title.isEmpty else { continue }
+        let uri = (t["uri"] as? String) ?? ""
+        tracks.append(Track(title: title, artist: (t["subtitle"] as? String) ?? "", durationMs: (t["duration"] as? Int) ?? 0,
+                            album: isAlbum ? name : "", artURL: art, spotifyID: uri.components(separatedBy: ":").last ?? ""))
     }
+    if isAlbum { for i in tracks.indices { tracks[i].number = i + 1; tracks[i].total = tracks.count } }
     return tracks.isEmpty ? nil : SpotifyList(name: name, isCollection: true, tracks: tracks)
 }
 
@@ -156,11 +187,11 @@ func safeFileName(_ s: String) -> String {
 
 func trackLabel(_ t: Track) -> String { t.artist.isEmpty ? t.title : "\(t.artist) - \(t.title)" }
 
-/// One song: search YouTube. `strict` keeps only results whose length is within a few seconds of Spotify's.
-func buildTrackArguments(track: Track, strict: Bool, audio: Bool, height: String, folder: String,
-                         js: (String, String)?, ffmpeg: String?) -> [String] {
+/// One song: search YouTube (audio only, m4a so the tags can be written). `strict` keeps only results whose length is
+/// within a few seconds of Spotify's.
+func buildTrackArguments(track: Track, strict: Bool, folder: String, js: (String, String)?, ffmpeg: String?) -> [String] {
     let out = safeFileName(trackLabel(track)).replacingOccurrences(of: "%", with: "%%") + ".%(ext)s"
-    var a = commonArguments(audio: audio, height: height, folder: folder, playlist: false, js: js, ffmpeg: ffmpeg, outTemplate: out)
+    var a = commonArguments(audio: true, height: "720", folder: folder, playlist: false, js: js, ffmpeg: ffmpeg, outTemplate: out, audioFormat: "m4a")
     let query = trackLabel(track).replacingOccurrences(of: " - ", with: " ")
     a += ["--max-downloads", "1"]
     if strict && track.durationMs > 0 {
@@ -238,16 +269,26 @@ func selfTest() -> Bool {
     eq(parseSpotifyLink("spotify:track:3z8h0TU7ReDPLIbEnYhWZb"), SpotifyRef(kind: "track", id: "3z8h0TU7ReDPLIbEnYhWZb"), "uri")
     eq(parseSpotifyLink("https://open.spotify.com/artist/3z8h0TU7ReDPLIbEnYhWZb"), nil, "artist not supported")
     eq(parseSpotifyLink("https://evil.com/?u=https://open.spotify.com/track/3z8h0TU7ReDPLIbEnYhWZb"), nil, "must start with spotify")
-    let page = "<html><script id=\"__NEXT_DATA__\" type=\"application/json\">{\"props\":{\"pageProps\":{\"state\":{\"data\":{\"entity\":{\"type\":\"album\",\"name\":\"Abbey Road\",\"trackList\":[{\"title\":\"Come Together\",\"subtitle\":\"The Beatles\",\"duration\":259946},{\"title\":\"Something\",\"subtitle\":\"The Beatles\",\"duration\":182000},{\"subtitle\":\"no title\"}]}}}}}}</script></html>"
+    let page = "<html><script id=\"__NEXT_DATA__\" type=\"application/json\">{\"props\":{\"pageProps\":{\"state\":{\"data\":{\"entity\":{\"type\":\"album\",\"name\":\"Abbey Road\",\"visualIdentity\":{\"image\":[{\"url\":\"https://image-cdn/ab67616d00001e02abc\",\"maxWidth\":300},{\"url\":\"https://image-cdn/ab67616d00004851abc\",\"maxWidth\":64}]},\"trackList\":[{\"title\":\"Come Together\",\"subtitle\":\"The Beatles\",\"duration\":259946,\"uri\":\"spotify:track:2EqlS6tkEnglzr7tkKAAYD\"},{\"title\":\"Something\",\"subtitle\":\"The Beatles\",\"duration\":182000},{\"subtitle\":\"no title\"}]}}}}}}</script></html>"
     let al = spotifyEntity(fromHTML: page).flatMap(parseSpotifyEntity)
     eq(al?.name, "Abbey Road", "album name")
     eq(al?.isCollection, true, "album is collection")
-    eq(al?.tracks, [Track(title: "Come Together", artist: "The Beatles", durationMs: 259946), Track(title: "Something", artist: "The Beatles", durationMs: 182000)], "album tracks")
-    let one = parseSpotifyEntity(["type": "track", "name": "Bohemian Rhapsody", "duration": 354947, "artists": [["name": "Queen"], ["name": "Other"]]])
-    eq(one?.tracks, [Track(title: "Bohemian Rhapsody", artist: "Queen, Other", durationMs: 354947)], "single track")
+    eq(al?.tracks.map { $0.title }, ["Come Together", "Something"], "album tracks")
+    eq(al?.tracks.map { $0.album }, ["Abbey Road", "Abbey Road"], "album name on tracks")
+    eq(al?.tracks.map { $0.number }, [1, 2], "track numbers")
+    eq(al?.tracks.first?.total, 2, "track total")
+    eq(al?.tracks.first?.artURL, "https://image-cdn/ab67616d0000b273abc", "album art upgraded to 640 px")
+    eq(al?.tracks.first?.spotifyID, "2EqlS6tkEnglzr7tkKAAYD", "spotify id from uri")
+    let one = parseSpotifyEntity(["type": "track", "name": "Bohemian Rhapsody", "duration": 354947, "id": "TID", "artists": [["name": "Queen"], ["name": "Other"]],
+                                  "releaseDate": ["isoString": "2018-10-19T00:00:00Z"], "visualIdentity": ["image": [["url": "https://c/ab67616d00001e02zz", "maxWidth": 300]]]])
+    eq(one?.tracks, [Track(title: "Bohemian Rhapsody", artist: "Queen, Other", durationMs: 354947, album: "", year: "2018", artURL: "https://c/ab67616d0000b273zz", number: 0, total: 0, spotifyID: "TID")], "single track")
     eq(one?.isCollection, false, "single is not a collection")
     eq(spotifyEntity(fromHTML: "<html>nothing</html>") == nil, true, "no data page")
     eq(parseSpotifyEntity(["type": "playlist", "name": "x", "trackList": []]) == nil, true, "empty list is nil")
+    let pl = parseSpotifyEntity(["type": "playlist", "name": "Mix", "visualIdentity": ["image": [["url": "https://c/ab67616d00001e02pp", "maxWidth": 300]]], "trackList": [["title": "A", "subtitle": "B", "duration": 1000, "uri": "spotify:track:XYZ"]]])
+    eq(pl?.tracks.first?.artURL, "", "playlist picture is not used as song art")
+    eq(pl?.tracks.first?.album, "", "no album name for playlist songs")
+    eq(pl?.tracks.first?.number, 0, "no track number in playlists")
     eq(safeFileName("AC/DC: Back In Black?"), "AC DC Back In Black", "safe name")
     eq(safeFileName("..."), "Spotify", "empty safe name")
     eq(isSpotifyAddress("https://open.spotify.com/artist/abc"), true, "spotify address")
@@ -255,15 +296,17 @@ func selfTest() -> Bool {
     eq(isSpotifyAddress("https://notspotify.com/x"), false, "lookalike host")
     eq(isSpotifyAddress("https://youtube.com/watch?v=1"), false, "youtube is not spotify")
     let t = Track(title: "100% Pure", artist: "Queen", durationMs: 200000)
-    let strict = buildTrackArguments(track: t, strict: true, audio: true, height: "720", folder: "/t", js: nil, ffmpeg: nil)
+    let strict = buildTrackArguments(track: t, strict: true, folder: "/t", js: nil, ffmpeg: nil)
     eq(Array(strict.suffix(2)), ["--", "ytsearch5:Queen 100% Pure"], "strict search query")
     eq(strict[strict.firstIndex(of: "--match-filter")! + 1], "duration>=190 & duration<=210", "duration window")
     eq(strict[strict.firstIndex(of: "--max-downloads")! + 1], "1", "max one download")
     eq(strict[strict.firstIndex(of: "-o")! + 1], "Queen - 100%% Pure.%(ext)s", "percent escaped in file name")
-    let loose = buildTrackArguments(track: t, strict: false, audio: true, height: "720", folder: "/t", js: nil, ffmpeg: nil)
+    let loose = buildTrackArguments(track: t, strict: false, folder: "/t", js: nil, ffmpeg: nil)
     eq(Array(loose.suffix(2)), ["--", "ytsearch1:Queen 100% Pure"], "loose search")
     eq(loose.contains("--match-filter"), false, "no filter when loose")
-    let nodur = buildTrackArguments(track: Track(title: "X", artist: "", durationMs: 0), strict: true, audio: true, height: "720", folder: "/t", js: nil, ffmpeg: nil)
+    let nodur = buildTrackArguments(track: Track(title: "X", artist: "", durationMs: 0), strict: true, folder: "/t", js: nil, ffmpeg: nil)
+    eq(strict[strict.firstIndex(of: "-f")! + 1], "bestaudio[ext=m4a]/bestaudio/best", "songs prefer m4a so tags can be written")
+    eq(formatFor(audio: true, height: "720", ffmpeg: nil, audioFormat: "best"), "bestaudio/best", "best audio format")
     eq(Array(nodur.suffix(2)), ["--", "ytsearch1:X"], "no length known uses plain search")
     print("\(passed) passed, \(failed) failed")
     return failed == 0
