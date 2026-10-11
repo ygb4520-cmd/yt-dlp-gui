@@ -8,7 +8,16 @@ struct Row: Identifiable {
     var file: String?
 }
 
+struct PickerRequest: Identifiable {
+    let id = UUID()
+    let name: String
+    let tracks: [Track]
+}
+
 final class Model: ObservableObject {
+    @Published var picker: PickerRequest?
+    private var pickerResult: (([Int]?) -> Void)?
+
     @Published var rows: [Row] = []
     @Published var log = ""
     @Published var progress = 0.0
@@ -35,11 +44,30 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Called from the background thread: shows the song list and waits until the user is done.
+    func chooseSongs(_ list: SpotifyList) -> [Int]? {
+        let sem = DispatchSemaphore(value: 0)
+        var result: [Int]?
+        DispatchQueue.main.async {
+            self.pickerResult = { sel in result = sel; sem.signal() }
+            self.picker = PickerRequest(name: list.name, tracks: list.tracks)
+        }
+        sem.wait()
+        return result
+    }
+
+    func finishPicker(_ selection: [Int]?) {
+        let done = pickerResult
+        pickerResult = nil
+        picker = nil
+        done?(selection)
+    }
+
     func addLog(_ text: String) { log += (log.isEmpty ? "" : "\n") + text }
 
     func cancel() { runner.cancel() }
 
-    func start(links: String, audio: Bool, height: String, folder: String, playlist: Bool, audioFormat: String) {
+    func start(links: String, audio: Bool, height: String, folder: String, playlist: Bool, audioFormat: String, askSongs: Bool) {
         guard !busy else { return }
         guard let base = ytdlp else { addLog("yt-dlp was not found."); return }
         let lines = links.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -55,7 +83,8 @@ final class Model: ObservableObject {
         busy = true
         let (js, ffmpeg) = (self.js, self.ffmpeg)
         DispatchQueue.global(qos: .userInitiated).async { [runner] in
-            let jobs = planJobs(lines: lines, baseFolder: dir) { text in DispatchQueue.main.async { self.addLog(text) } }
+            let jobs = planJobs(lines: lines, baseFolder: dir, log: { text in DispatchQueue.main.async { self.addLog(text) } },
+                                choose: askSongs ? { self.chooseSongs($0) } : nil)
             DispatchQueue.main.async { self.apply(.plan(jobs.map { $0.label })) }
             if jobs.isEmpty { DispatchQueue.main.async { self.apply(.finished) }; return }
             runner.run(base: base, jobs: jobs, audio: audio, height: height, playlist: playlist, js: js, ffmpeg: ffmpeg, audioFormat: audioFormat) { ev in
@@ -93,6 +122,7 @@ struct ContentView: View {
     @AppStorage("mode") private var mode = "video"
     @AppStorage("height") private var height = "720"
     @AppStorage("audioFormat") private var audioFormat = "m4a"
+    @AppStorage("askSongs") private var askSongs = true
     @AppStorage("playlist") private var playlist = false
     @AppStorage("folder") private var folder = defaultFolder
 
@@ -134,6 +164,7 @@ struct ContentView: View {
                 .frame(width: 250)
                 .disabled(!audio)
                 Toggle("Whole playlist", isOn: $playlist)
+                Toggle("Choose Spotify songs", isOn: $askSongs)
                 Spacer()
             }
 
@@ -151,7 +182,7 @@ struct ContentView: View {
             }
 
             HStack {
-                Button("Download") { model.start(links: links, audio: audio, height: height, folder: folder, playlist: playlist, audioFormat: audioFormat) }
+                Button("Download") { model.start(links: links, audio: audio, height: height, folder: folder, playlist: playlist, audioFormat: audioFormat, askSongs: askSongs) }
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(model.busy)
                 Button("Cancel") { model.cancel() }.disabled(!model.busy)
@@ -183,6 +214,9 @@ struct ContentView: View {
         }
         .padding(16)
         .frame(minWidth: 640, minHeight: 600)
+        .sheet(item: $model.picker, onDismiss: { model.finishPicker(nil) }) { req in
+            SongPicker(request: req) { model.finishPicker($0) }
+        }
     }
 
     private var hint: String {
@@ -193,7 +227,7 @@ struct ContentView: View {
 
     private func color(for status: String) -> Color {
         switch status {
-        case _ where status.hasPrefix("Done"): return status == "Done" ? .green : .orange
+        case _ where status.hasPrefix("Done"): return (status.contains("top result") || status.contains("tags")) ? .orange : .green
         case "Failed": return .red
         default: return .secondary
         }
@@ -217,6 +251,53 @@ struct ContentView: View {
             UserDefaults.standard.set(u.path, forKey: "ytdlpPath")
             model.refreshTools(saved: u.path)
         }
+    }
+}
+
+struct SongPicker: View {
+    let request: PickerRequest
+    let finish: ([Int]?) -> Void
+    @State private var selected: Set<Int>
+
+    init(request: PickerRequest, finish: @escaping ([Int]?) -> Void) {
+        self.request = request
+        self.finish = finish
+        _selected = State(initialValue: Set(request.tracks.indices))
+    }
+
+    private func length(_ ms: Int) -> String { ms > 0 ? String(format: "%d:%02d", ms / 60000, (ms / 1000) % 60) : "" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(request.name).font(.headline)
+            Text("Pick the songs to download.").font(.footnote).foregroundColor(.secondary)
+            HStack {
+                Button("Select all") { selected = Set(request.tracks.indices) }
+                Button("Select none") { selected = [] }
+                Spacer()
+                Text("\(selected.count) of \(request.tracks.count) selected").foregroundColor(.secondary)
+            }
+            List(Array(request.tracks.enumerated()), id: \.offset) { i, t in
+                Toggle(isOn: Binding(get: { selected.contains(i) }, set: { on in if on { selected.insert(i) } else { selected.remove(i) } })) {
+                    HStack {
+                        Text("\(i + 1).").foregroundColor(.secondary).frame(width: 34, alignment: .trailing)
+                        Text(trackLabel(t)).lineLimit(1).truncationMode(.tail)
+                        Spacer()
+                        Text(length(t.durationMs)).foregroundColor(.secondary).monospacedDigit()
+                    }
+                }
+            }
+            .frame(minHeight: 260)
+            HStack {
+                Button("Skip this one") { finish([]) }
+                Spacer()
+                Button("Download \(selected.count) song\(selected.count == 1 ? "" : "s")") { finish(Array(selected)) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(selected.isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 520, height: 480)
     }
 }
 

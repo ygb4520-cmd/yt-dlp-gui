@@ -230,19 +230,83 @@ def track_label(t):
     return '%s - %s' % (t['artist'], t['title']) if t['artist'] else t['title']
 
 
-def build_track_cmd(base, track, strict, folder, js, ffmpeg=None):
-    """One song: search YouTube (audio only, m4a so the tags can be written). `strict` keeps only results whose
-    length is within a few seconds of Spotify's."""
+# Where to look on YouTube for a Spotify song, in this order: YouTube Music, a lyric video, an official video,
+# any music video, and last the plain top result.
+SOURCES = [('ytmusic', 'YT Music'), ('lyric', 'lyric video'), ('official', 'official video'), ('musicvideo', 'music video'), ('top', 'top result')]
+UNWANTED_WORDS = ['cover', 'karaoke', 'live', 'remix', 'instrumental', 'reaction', 'slowed', 'sped up', 'nightcore', '8d', 'mashup']
+
+
+def percent_encode_query(s):
+    import urllib.parse
+    return urllib.parse.quote(s, safe='-._~')
+
+
+def track_query(t):
+    return track_label(t).replace(' - ', ' ')
+
+
+def ytmusic_search_url(t):
+    return 'https://music.youtube.com/search?q=' + percent_encode_query(track_query(t))
+
+
+def watch_links(listing, limit=5):
+    """Watch links from a YouTube Music search listing (artist and album pages in the listing are ignored)."""
+    out = []
+    for line in listing.splitlines():
+        m = re.search(r'/watch\?v=([A-Za-z0-9_-]{11})', line)
+        if not m:
+            continue
+        url = 'https://www.youtube.com/watch?v=' + m.group(1)
+        if url not in out:
+            out.append(url)
+        if len(out) == limit:
+            break
+    return out
+
+
+def exclusion_filter(t):
+    """Skips covers, live versions, remixes and so on, unless the song's own name says so."""
+    label = track_label(t).lower()
+    words = [w for w in UNWANTED_WORDS if w not in label]
+    return ('title!~=(?i)\\b(' + '|'.join(words) + ')\\b') if words else None
+
+
+def duration_filter(t, slack):
+    if t['duration_ms'] <= 0:
+        return None
+    d = int(round(t['duration_ms'] / 1000.0))
+    return 'duration>=%d & duration<=%d' % (d - slack, d + slack)
+
+
+def ytmusic_listing_cmd(base, track, js):
+    cmd = list(base) + ['--flat-playlist', '--playlist-end', '8', '--print', '%(webpage_url)s']
+    if js:
+        cmd += ['--js-runtimes', '%s:%s' % js]
+    return cmd + ['--', ytmusic_search_url(track)]
+
+
+def build_track_cmd(base, track, source, candidates, folder, js, ffmpeg=None):
+    """One song from one place (audio only, m4a so the tags can be written). For 'ytmusic', `candidates` are the song
+    links found by listing a YouTube Music search."""
     out = safe_file_name(track_label(track)).replace('%', '%%') + '.%(ext)s'
     cmd = build_cmd(base, 'x', 'audio', '720', folder, False, js, ffmpeg, 'm4a')[:-2]   # drop the trailing "-- x"
     cmd[cmd.index('-o') + 1] = out
-    query = track_label(track).replace(' - ', ' ')
     cmd += ['--max-downloads', '1']
-    if strict and track['duration_ms'] > 0:
-        d = int(round(track['duration_ms'] / 1000.0))
-        cmd += ['--match-filter', 'duration>=%d & duration<=%d' % (d - DURATION_SLACK, d + DURATION_SLACK)]
-        return cmd + ['--', 'ytsearch5:' + query]
-    return cmd + ['--', 'ytsearch1:' + query]
+    q = track_query(track)
+    if source == 'ytmusic':
+        conds, target = [duration_filter(track, DURATION_SLACK)], list(candidates)
+    elif source == 'lyric':
+        conds, target = [duration_filter(track, DURATION_SLACK), 'title~=(?i)lyric', exclusion_filter(track)], ['ytsearch10:%s lyrics' % q]
+    elif source == 'official':
+        conds, target = [duration_filter(track, 20), 'title~=(?i)official', exclusion_filter(track)], ['ytsearch10:%s official video' % q]
+    elif source == 'musicvideo':
+        conds, target = [duration_filter(track, 20), exclusion_filter(track)], ['ytsearch10:%s music video' % q]
+    else:
+        conds, target = [], ['ytsearch1:' + q]
+    flt = ' & '.join(c for c in conds if c)
+    if flt:
+        cmd += ['--match-filter', flt]
+    return cmd + ['--'] + target
 
 
 def http_get(url, timeout=20):
@@ -280,7 +344,7 @@ def enrich_track(t):
     return r
 
 
-def plan_jobs(lines, base_folder, log):
+def plan_jobs(lines, base_folder, log, choose=None):
     """Plain links stay as they are; Spotify links become one job per song."""
     jobs, plain = [], 0
     for line in lines:
@@ -292,12 +356,18 @@ def plan_jobs(lines, base_folder, log):
                 continue
             folder = os.path.join(base_folder, safe_file_name(lst['name'])) if lst['collection'] else base_folder
             tracks = lst['tracks']
+            if lst['collection'] and len(tracks) > 1 and choose:   # let the user pick which songs
+                picked = choose(lst)
+                if not picked:
+                    log('Skipped "%s" (no songs chosen).' % lst['name'])
+                    continue
+                tracks = [tracks[i] for i in sorted(set(picked)) if 0 <= i < len(tracks)]
             if len(tracks) > MAX_TRACKS:
                 log('Only the first %d songs of "%s" are used.' % (MAX_TRACKS, lst['name']))
                 tracks = tracks[:MAX_TRACKS]
-            log('Spotify: "%s" has %d song%s. Searching YouTube for each one%s' % (
-                lst['name'], len(lst['tracks']), '' if len(lst['tracks']) == 1 else 's',
-                ', saving into a folder named after it.' if lst['collection'] else '.'))
+            log('Spotify: "%s" - %s song%s. Looking on YouTube Music, then lyric videos, then music videos%s' % (
+                lst['name'], str(len(tracks)) if len(tracks) == len(lst['tracks']) else '%d of %d' % (len(tracks), len(lst['tracks'])),
+                '' if len(tracks) == 1 else 's', ', saving into a folder named after it.' if lst['collection'] else '.'))
             jobs += [{'label': track_label(t), 'kind': 'track', 'track': t, 'folder': folder} for t in tracks]
         elif is_spotify_address(line):
             log('%s\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; '
@@ -417,9 +487,12 @@ class Downloader:
         self.events = events
         self.proc = None
         self.cancelled = False
+        self.sources = [k for k, _ in SOURCES]   # tests can limit which places are tried
+        self.debug = bool(os.environ.get('YTGUI_DEBUG'))
 
-    def start(self, base, lines, mode, height, folder, playlist, js, ffmpeg=None, audio_format='m4a'):
+    def start(self, base, lines, mode, height, folder, playlist, js, ffmpeg=None, audio_format='m4a', choose_songs=False):
         self.cancelled = False
+        self.choose_songs = choose_songs
         threading.Thread(target=self._run, args=(base, lines, mode, height, folder, playlist, js, ffmpeg, audio_format), daemon=True).start()
 
     def stop(self):
@@ -433,6 +506,33 @@ class Downloader:
 
     def _log(self, text):
         self.events.put(('log', text))
+
+    def _ask(self, lst):
+        """Called from the worker thread: the window shows the song list and the answer comes back through a queue."""
+        reply = queue.Queue()
+        self.events.put(('choose', lst['name'], lst['tracks'], reply))
+        return reply.get()
+
+    def _run_retry(self, i, cmd):
+        """YouTube sometimes answers a download with "403 Forbidden" for no lasting reason, so try up to 3 times."""
+        code, err, path = self._run_one(i, cmd)
+        attempt = 1
+        while not path and code != 0 and not self.cancelled and 'HTTP Error 403' in err and attempt < 3:
+            attempt += 1
+            self.events.put(('row', i, 'Retrying (%d/3)...' % attempt))
+            code, err, path = self._run_one(i, cmd)
+        return code, err, path
+
+    def _capture(self, cmd):
+        """Runs yt-dlp and returns what it printed (used to list YouTube Music search results)."""
+        flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                         encoding='utf-8', errors='replace', creationflags=flags)
+            out = self.proc.communicate()[0]
+            return out or ''
+        except Exception:
+            return ''
 
     def _run_one(self, i, cmd):
         flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
@@ -457,7 +557,7 @@ class Downloader:
         return code, err, last_file
 
     def _run(self, base, lines, mode, height, folder, playlist, js, ffmpeg, audio_format):
-        jobs = plan_jobs(lines, folder, self._log)
+        jobs = plan_jobs(lines, folder, self._log, self._ask if self.choose_songs else None)
         self.events.put(('plan', [j['label'] for j in jobs]))
         for i, job in enumerate(jobs):
             if self.cancelled:
@@ -469,7 +569,7 @@ class Downloader:
             except OSError:
                 pass
             if job['kind'] == 'link':
-                code, err, _ = self._run_one(i, build_cmd(base, job['url'], mode, height, job['folder'], playlist, js, ffmpeg, audio_format))
+                code, err, _ = self._run_retry(i, build_cmd(base, job['url'], mode, height, job['folder'], playlist, js, ffmpeg, audio_format))
                 if self.cancelled:
                     self.events.put(('row', i, 'Cancelled'))
                 elif code == 0:
@@ -481,31 +581,48 @@ class Downloader:
                         why = NEEDS_FFMPEG
                     self._log('%s\n  %s' % (job['url'], why))
                 continue
-            # a Spotify song: always audio (m4a, so the tags and cover art can be written)
+            # a Spotify song: always audio (m4a, so the tags and cover art can be written).
+            # Look in order: YouTube Music, a lyric video, an official video, any music video, the top result.
             t = job['track']
-            code, err, path = self._run_one(i, build_track_cmd(base, t, True, job['folder'], js, ffmpeg))
-            differs = False
-            if not path and not self.cancelled and t['duration_ms'] > 0:   # nothing within a few seconds of Spotify's length: take the top result
-                self.events.put(('row', i, 'Trying top result...'))
-                code, err, path = self._run_one(i, build_track_cmd(base, t, False, job['folder'], js, ffmpeg))
-                differs = bool(path)
+            found, last_error = None, ''
+            labels = dict(SOURCES)
+            for source in self.sources:
+                if self.cancelled:
+                    break
+                self.events.put(('row', i, 'Looking: %s...' % labels[source]))
+                candidates = []
+                if source == 'ytmusic':
+                    candidates = watch_links(self._capture(ytmusic_listing_cmd(base, t, js)))
+                    if not candidates:
+                        if self.debug:
+                            self._log('debug: %s: no song links in the listing' % labels[source])
+                        continue
+                code, err, path = self._run_retry(i, build_track_cmd(base, t, source, candidates, job['folder'], js, ffmpeg))
+                if path:
+                    found = (path, source)
+                    break
+                if self.debug:
+                    self._log('debug: %s: nothing (exit %s) %s' % (labels[source], code, err))
+                if err:
+                    last_error = err
             if self.cancelled:
                 self.events.put(('row', i, 'Cancelled'))
-            elif path:
-                status = 'Done (length differs)' if differs else 'Done'
+            elif found:
+                path, source = found
+                status = 'Done (%s)' % labels[source]
                 if path.lower().endswith('.m4a'):
                     self.events.put(('row', i, 'Adding tags...'))
                     note = tag_m4a(path, t)
                     if note:
-                        status = 'Done (tags: see log)' if status == 'Done' else status
+                        status += ' - tags: see log'
                         self._log('%s\n  %s' % (job['label'], note))
                 else:
-                    status = 'Done (no tags)' if status == 'Done' else status
+                    status += ' - no tags'
                     self._log('%s\n  Saved as %s, which cannot hold tags.' % (job['label'], os.path.splitext(path)[1]))
                 self.events.put(('row', i, status))
             else:
                 self.events.put(('row', i, 'Failed'))
-                self._log('%s\n  %s' % (job['label'], err or 'No match found on YouTube.'))
+                self._log('%s\n  %s' % (job['label'], last_error or 'No match found on YouTube Music, lyric videos or music videos.'))
         self.events.put(('finished',))
 
 
@@ -546,6 +663,7 @@ def main(smoke=False, shot=None):
             self.height = tk.StringVar(value=s.get('height', '720') if s.get('height') in HEIGHTS else '720')
             self.audio_format = tk.StringVar(value=s.get('audio_format', 'm4a') if s.get('audio_format') in ('m4a', 'best') else 'm4a')
             self.playlist = tk.BooleanVar(value=bool(s.get('playlist', False)))
+            self.ask_songs = tk.BooleanVar(value=bool(s.get('ask_songs', True)))
             self.folder = tk.StringVar(value=s.get('folder') or DEFAULT_FOLDER)
             self.build()
             self.mode_changed()
@@ -559,7 +677,7 @@ def main(smoke=False, shot=None):
             pad = {'padx': 12, 'pady': 4}
             ttk.Label(self, text='Links (one per line)').pack(anchor='w', **pad)
             ttk.Label(self, foreground='#777777', wraplength=600, justify='left',
-                      text='Website links, or a Spotify song, album or playlist link. Spotify songs are always saved as audio (m4a) with title, artist, cover art and more written in, each one searched on YouTube.').pack(anchor='w', padx=12)
+                      text='Website links, or a Spotify song, album or playlist link. Spotify songs are always saved as audio (m4a) with title, artist, cover art and more written in. Each song is looked up on YouTube Music, then lyric videos, then music videos.').pack(anchor='w', padx=12)
             box = ttk.Frame(self)
             box.pack(fill='x', padx=12)
             self.links = tk.Text(box, height=5, wrap='none', undo=True)
@@ -573,7 +691,8 @@ def main(smoke=False, shot=None):
             ttk.Label(row, text='Max height').pack(side='left')
             self.height_box = ttk.Combobox(row, textvariable=self.height, values=HEIGHTS, width=6, state='readonly')
             self.height_box.pack(side='left', padx=(6, 16))
-            ttk.Checkbutton(row, text='Whole playlist', variable=self.playlist).pack(side='left', padx=(0, 16))
+            ttk.Checkbutton(row, text='Whole playlist', variable=self.playlist).pack(side='left', padx=(0, 10))
+            ttk.Checkbutton(row, text='Choose Spotify songs', variable=self.ask_songs).pack(side='left', padx=(0, 16))
             ttk.Label(row, text='Audio').pack(side='left')
             self.audio_box = ttk.Combobox(row, textvariable=self.audio_format, values=['m4a', 'best'], width=6, state='readonly')
             self.audio_box.pack(side='left', padx=(6, 0))
@@ -672,19 +791,67 @@ def main(smoke=False, shot=None):
             except OSError as e:
                 messagebox.showerror('Save to', 'Cannot use that folder: %s' % e)
                 return
-            save_settings({'mode': self.mode.get(), 'height': self.height.get(), 'audio_format': self.audio_format.get(), 'playlist': self.playlist.get(), 'folder': folder})
+            save_settings({'mode': self.mode.get(), 'height': self.height.get(), 'audio_format': self.audio_format.get(), 'playlist': self.playlist.get(), 'ask_songs': self.ask_songs.get(), 'folder': folder})
             self.tree.delete(*self.tree.get_children())
             self.files = {}
             self.busy = True
             self.go.configure(state='disabled')
             self.bar['value'] = 0
-            self.dl.start(self.base, lines, self.mode.get(), self.height.get(), folder, self.playlist.get(), self.js, self.ffmpeg, self.audio_format.get())
+            self.dl.start(self.base, lines, self.mode.get(), self.height.get(), folder, self.playlist.get(), self.js, self.ffmpeg, self.audio_format.get(), self.ask_songs.get())
+
+        def choose_dialog(self, name, tracks, reply):
+            """A window listing the songs of an album or playlist; the user ticks the ones to download."""
+            win = tk.Toplevel(self)
+            win.title(name)
+            win.geometry('520x460')
+            win.transient(self)
+            ttk.Label(win, text=name, font=('TkDefaultFont', 12, 'bold')).pack(anchor='w', padx=12, pady=(12, 0))
+            ttk.Label(win, text='Pick the songs to download (click, or Shift/Ctrl-click for several).', foreground='#777777').pack(anchor='w', padx=12)
+            frame = ttk.Frame(win)
+            frame.pack(fill='both', expand=True, padx=12, pady=8)
+            lb = tk.Listbox(frame, selectmode='extended', activestyle='none')
+            sb = ttk.Scrollbar(frame, orient='vertical', command=lb.yview)
+            lb.configure(yscrollcommand=sb.set)
+            for i, t in enumerate(tracks):
+                secs = int(round(t['duration_ms'] / 1000.0))
+                lb.insert('end', '%3d.  %s%s' % (i + 1, track_label(t), ('   (%d:%02d)' % (secs // 60, secs % 60)) if secs else ''))
+            lb.selection_set(0, 'end')
+            lb.pack(side='left', fill='both', expand=True)
+            sb.pack(side='left', fill='y')
+            count = ttk.Label(win)
+            count.pack(anchor='w', padx=12)
+            answered = []
+
+            def refresh(_e=None):
+                count.configure(text='%d of %d selected' % (len(lb.curselection()), len(tracks)))
+                ok.configure(state='normal' if lb.curselection() else 'disabled')
+
+            def answer(value):
+                if answered:
+                    return
+                answered.append(1)
+                reply.put(value)
+                win.destroy()
+
+            bar = ttk.Frame(win)
+            bar.pack(fill='x', padx=12, pady=(4, 12))
+            ttk.Button(bar, text='Select all', command=lambda: (lb.selection_set(0, 'end'), refresh())).pack(side='left')
+            ttk.Button(bar, text='Select none', command=lambda: (lb.selection_clear(0, 'end'), refresh())).pack(side='left', padx=6)
+            ttk.Button(bar, text='Skip this one', command=lambda: answer([])).pack(side='right')
+            ok = ttk.Button(bar, text='Download selected', command=lambda: answer(list(lb.curselection())))
+            ok.pack(side='right', padx=6)
+            lb.bind('<<ListboxSelect>>', refresh)
+            win.protocol('WM_DELETE_WINDOW', lambda: answer([]))
+            refresh()
+            win.grab_set()
 
         def poll(self):
             try:
                 while True:
                     ev = self.events.get_nowait()
-                    if ev[0] == 'plan':
+                    if ev[0] == 'choose':
+                        self.choose_dialog(ev[1], ev[2], ev[3])
+                    elif ev[0] == 'plan':
                         for i, label in enumerate(ev[1]):
                             self.tree.insert('', 'end', iid=str(i), values=(label, 'Waiting'))
                     elif ev[0] == 'row':
@@ -793,19 +960,61 @@ def selftest():
     eq(safe_file_name('AC/DC: Back In Black?'), 'AC DC Back In Black', 'safe name')
     eq(safe_file_name('...'), 'Spotify', 'empty safe name')
     t = new_track('100% Pure', 'Queen', 200000)
-    st = build_track_cmd(['y'], t, True, '/t', None)
-    eq(st[-2:], ['--', 'ytsearch5:Queen 100% Pure'], 'strict search query')
-    eq(st[st.index('--match-filter') + 1], 'duration>=190 & duration<=210', 'duration window')
-    eq(st[st.index('-o') + 1], 'Queen - 100%% Pure.%(ext)s', 'percent escaped in file name')
-    eq(st[st.index('-f') + 1], 'bestaudio[ext=m4a]/bestaudio/best', 'songs prefer m4a')
-    eq(build_track_cmd(['y'], t, False, '/t', None)[-2:], ['--', 'ytsearch1:Queen 100% Pure'], 'loose search')
-    eq('--match-filter' in build_track_cmd(['y'], t, False, '/t', None), False, 'no filter when loose')
-    eq(build_track_cmd(['y'], new_track('X', '', 0), True, '/t', None)[-2:], ['--', 'ytsearch1:X'], 'no length known')
+
+    def cmd(src, cands=None, tr=None):
+        return build_track_cmd(['y'], tr or t, src, cands or [], '/t', None)
+
+    def flt(c):
+        return c[c.index('--match-filter') + 1] if '--match-filter' in c else None
+    eq(cmd('lyric')[-2:], ['--', 'ytsearch10:Queen 100% Pure lyrics'], 'lyric search')
+    eq(flt(cmd('lyric')), 'duration>=190 & duration<=210 & title~=(?i)lyric & title!~=(?i)\\b(cover|karaoke|live|remix|instrumental|reaction|slowed|sped up|nightcore|8d|mashup)\\b', 'lyric filter')
+    eq(cmd('official')[-2:], ['--', 'ytsearch10:Queen 100% Pure official video'], 'official search')
+    eq(flt(cmd('official')).startswith('duration>=180 & duration<=220 & title~=(?i)official'), True, 'official filter has a wider window')
+    eq(cmd('musicvideo')[-2:], ['--', 'ytsearch10:Queen 100% Pure music video'], 'music video search')
+    eq('title~=(?i)official' in flt(cmd('musicvideo')), False, 'music video tier does not need official')
+    eq(cmd('top')[-2:], ['--', 'ytsearch1:Queen 100% Pure'], 'top result')
+    eq(flt(cmd('top')), None, 'no filter for the top result')
+    eq(cmd('ytmusic', ['https://www.youtube.com/watch?v=aaaaaaaaaaa'])[-2:], ['--', 'https://www.youtube.com/watch?v=aaaaaaaaaaa'], 'YT Music downloads from the listed songs only')
+    eq(flt(cmd('ytmusic', ['u'])), 'duration>=190 & duration<=210', 'YT Music duration window')
+    eq(cmd('top')[cmd('top').index('-o') + 1], 'Queen - 100%% Pure.%(ext)s', 'percent escaped in file name')
+    eq(cmd('top')[cmd('top').index('-f') + 1], 'bestaudio[ext=m4a]/bestaudio/best', 'songs prefer m4a')
+    eq(cmd('top')[cmd('top').index('--max-downloads') + 1], '1', 'max one download')
+    live = new_track('Live and Let Die', 'Paul McCartney', 190000)
+    eq('|live|' in exclusion_filter(live), False, 'a song called Live is not excluded for live')
+    eq('cover' in exclusion_filter(live), True, 'other words still excluded')
+    nodur = new_track('X', '', 0)
+    eq(flt(cmd('ytmusic', ['u'], nodur)), None, 'no length known: no length filter')
+    eq(cmd('top', None, nodur)[-2:], ['--', 'ytsearch1:X'], 'no artist')
+    eq(ytmusic_search_url(t), 'https://music.youtube.com/search?q=Queen%20100%25%20Pure', 'YT Music search address')
+    eq(percent_encode_query('a&b+c'), 'a%26b%2Bc', 'query encoding')
+    listing = 'https://music.youtube.com/watch?v=BSTsnWoslP4\nhttps://music.youtube.com/browse/UCEPMVbUzImPl4p8k4LkGevA\nhttps://music.youtube.com/browse/MPREb_9hHD965Z9xx\nhttps://music.youtube.com/watch?v=646p-BvYvpg\nhttps://music.youtube.com/watch?v=BSTsnWoslP4\nNA'
+    eq(watch_links(listing), ['https://www.youtube.com/watch?v=BSTsnWoslP4', 'https://www.youtube.com/watch?v=646p-BvYvpg'], 'only song links, no artists or albums, no repeats')
+    eq(len(watch_links(listing, 1)), 1, 'listing limit')
+    eq([k for k, _ in SOURCES], ['ytmusic', 'lyric', 'official', 'musicvideo', 'top'], 'search order')
     eq(format_for('audio', '720', None, 'best'), 'bestaudio/best', 'best audio format')
     logs = []
     jobs = plan_jobs(['https://a.com/v', '--exec=bad', 'https://open.spotify.com/artist/3z8h0TU7ReDPLIbEnYhWZb'], '/base', logs.append)
     eq([j['label'] for j in jobs], ['https://a.com/v'], 'plan keeps plain links only')
     eq(len(logs), 2, 'plan explains skipped lines')
+
+    # picking songs from an album
+    real_fetch = fetch_spotify
+    fake = {'name': 'Abbey Road', 'collection': True, 'tracks': [new_track('A', 'B', 1000), new_track('C', 'B', 2000), new_track('D', 'B', 3000)]}
+    globals()['fetch_spotify'] = lambda kind, sid: (fake, '')
+    try:
+        link = 'https://open.spotify.com/album/0ETFjACtuP2ADo6LFhL6HN'
+        seen = []
+        jobs = plan_jobs([link], '/base', lambda m: None, lambda lst: seen.append(lst['name']) or [2, 0])
+        eq([j['label'] for j in jobs], ['B - A', 'B - D'], 'only the chosen songs, in album order')
+        eq(seen, ['Abbey Road'], 'chooser was asked once')
+        eq(len(plan_jobs([link], '/base', lambda m: None, lambda lst: [])), 0, 'nothing chosen skips the album')
+        eq(len(plan_jobs([link], '/base', lambda m: None, None)), 3, 'no chooser: all songs')
+        eq(len(plan_jobs([link], '/base', lambda m: None, lambda lst: [0, 99])), 1, 'out-of-range picks ignored')
+        fake_single = {'name': 'One', 'collection': False, 'tracks': [new_track('A', 'B', 1000)]}
+        globals()['fetch_spotify'] = lambda kind, sid: (fake_single, '')
+        eq(len(plan_jobs(['https://open.spotify.com/track/3z8h0TU7ReDPLIbEnYhWZb'], '/base', lambda m: None, lambda lst: [])), 1, 'a single song is never asked about')
+    finally:
+        globals()['fetch_spotify'] = real_fetch
 
     # tag writer on a synthetic MP4 (header first, audio data after it, with a chunk-offset table that must move)
     def mp4(mdat_first):
@@ -853,9 +1062,11 @@ if __name__ == '__main__':
     if '--selftest' in sys.argv:
         sys.exit(0 if selftest() else 1)
     if '--download' in sys.argv:   # headless check: python3 yt_gui.py --download <url> <folder> <audio|video>
-        a = sys.argv[sys.argv.index('--download') + 1:]
+        a = [x for x in sys.argv[sys.argv.index('--download') + 1:] if x != '--tiers' and ',' not in x and x not in [k for k, _ in SOURCES]] if '--tiers' in sys.argv else sys.argv[sys.argv.index('--download') + 1:]
         q = queue.Queue()
         d = Downloader(q)
+        if '--tiers' in sys.argv:   # test only: --tiers ytmusic,lyric,official,musicvideo,top
+            d.sources = sys.argv[sys.argv.index('--tiers') + 1].split(',')
         d.start(find_ytdlp(), [a[0]], a[2] if len(a) > 2 else 'video', '720', a[1], False, find_js(), find_ffmpeg(), 'm4a')
         while True:
             ev = q.get()

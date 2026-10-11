@@ -187,19 +187,85 @@ func safeFileName(_ s: String) -> String {
 
 func trackLabel(_ t: Track) -> String { t.artist.isEmpty ? t.title : "\(t.artist) - \(t.title)" }
 
-/// One song: search YouTube (audio only, m4a so the tags can be written). `strict` keeps only results whose length is
-/// within a few seconds of Spotify's.
-func buildTrackArguments(track: Track, strict: Bool, folder: String, js: (String, String)?, ffmpeg: String?) -> [String] {
-    let out = safeFileName(trackLabel(track)).replacingOccurrences(of: "%", with: "%%") + ".%(ext)s"
-    var a = commonArguments(audio: true, height: "720", folder: folder, playlist: false, js: js, ffmpeg: ffmpeg, outTemplate: out, audioFormat: "m4a")
-    let query = trackLabel(track).replacingOccurrences(of: " - ", with: " ")
-    a += ["--max-downloads", "1"]
-    if strict && track.durationMs > 0 {
-        let d = Int((Double(track.durationMs) / 1000).rounded())
-        a += ["--match-filter", "duration>=\(d - durationSlackSeconds) & duration<=\(d + durationSlackSeconds)"]
-        return a + ["--", "ytsearch5:\(query)"]
+// MARK: - Where to look on YouTube for a Spotify song, in this order:
+// YouTube Music, then a lyric video, then an official video, then any music video, and last the plain top result.
+enum SearchSource: CaseIterable {
+    case ytMusic, lyric, official, musicVideo, top
+    var label: String {
+        switch self {
+        case .ytMusic: return "YT Music"
+        case .lyric: return "lyric video"
+        case .official: return "official video"
+        case .musicVideo: return "music video"
+        case .top: return "top result"
+        }
     }
-    return a + ["--", "ytsearch1:\(query)"]
+}
+
+func percentEncodeQuery(_ s: String) -> String {
+    s.addingPercentEncoding(withAllowedCharacters: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? s
+}
+
+func trackQuery(_ t: Track) -> String { trackLabel(t).replacingOccurrences(of: " - ", with: " ") }
+func ytMusicSearchURL(_ t: Track) -> String { "https://music.youtube.com/search?q=" + percentEncodeQuery(trackQuery(t)) }
+
+/// Watch links from a YouTube Music search listing (artist and album pages in the listing are ignored).
+func watchLinks(fromListing text: String, limit: Int = 5) -> [String] {
+    var out: [String] = []
+    for line in text.split(whereSeparator: \.isNewline) {
+        guard let r = line.range(of: #"/watch\?v=([A-Za-z0-9_-]{11})"#, options: .regularExpression) else { continue }
+        let id = String(line[r]).replacingOccurrences(of: "/watch?v=", with: "")
+        let url = "https://www.youtube.com/watch?v=" + id
+        if !out.contains(url) { out.append(url) }
+        if out.count == limit { break }
+    }
+    return out
+}
+
+let unwantedWords = ["cover", "karaoke", "live", "remix", "instrumental", "reaction", "slowed", "sped up", "nightcore", "8d", "mashup"]
+
+/// Skips covers, live versions, remixes and so on, unless the song's own name says so.
+func exclusionFilter(_ t: Track) -> String? {
+    let label = trackLabel(t).lowercased()
+    let words = unwantedWords.filter { !label.contains($0) }
+    return words.isEmpty ? nil : "title!~=(?i)\\b(" + words.joined(separator: "|") + ")\\b"
+}
+
+func durationFilter(_ t: Track, slack: Int) -> String? {
+    guard t.durationMs > 0 else { return nil }
+    let d = Int((Double(t.durationMs) / 1000).rounded())
+    return "duration>=\(d - slack) & duration<=\(d + slack)"
+}
+
+/// One song from one place (audio only, m4a so the tags can be written). For `.ytMusic`, `candidates` are the song links
+/// found by listing a YouTube Music search.
+func buildTrackArguments(track t: Track, source: SearchSource, candidates: [String] = [], folder: String,
+                         js: (String, String)?, ffmpeg: String?) -> [String] {
+    let out = safeFileName(trackLabel(t)).replacingOccurrences(of: "%", with: "%%") + ".%(ext)s"
+    var a = commonArguments(audio: true, height: "720", folder: folder, playlist: false, js: js, ffmpeg: ffmpeg, outTemplate: out, audioFormat: "m4a")
+    a += ["--max-downloads", "1"]
+    let q = trackQuery(t)
+    var conds: [String?] = []
+    var target: [String]
+    switch source {
+    case .ytMusic:
+        conds = [durationFilter(t, slack: durationSlackSeconds)]
+        target = candidates
+    case .lyric:
+        conds = [durationFilter(t, slack: durationSlackSeconds), "title~=(?i)lyric", exclusionFilter(t)]
+        target = ["ytsearch10:\(q) lyrics"]
+    case .official:
+        conds = [durationFilter(t, slack: 20), "title~=(?i)official", exclusionFilter(t)]
+        target = ["ytsearch10:\(q) official video"]
+    case .musicVideo:
+        conds = [durationFilter(t, slack: 20), exclusionFilter(t)]
+        target = ["ytsearch10:\(q) music video"]
+    case .top:
+        target = ["ytsearch1:\(q)"]
+    }
+    let filter = conds.compactMap { $0 }.joined(separator: " & ")
+    if !filter.isEmpty { a += ["--match-filter", filter] }
+    return a + ["--"] + target
 }
 
 enum OutLine: Equatable {
@@ -296,18 +362,35 @@ func selfTest() -> Bool {
     eq(isSpotifyAddress("https://notspotify.com/x"), false, "lookalike host")
     eq(isSpotifyAddress("https://youtube.com/watch?v=1"), false, "youtube is not spotify")
     let t = Track(title: "100% Pure", artist: "Queen", durationMs: 200000)
-    let strict = buildTrackArguments(track: t, strict: true, folder: "/t", js: nil, ffmpeg: nil)
-    eq(Array(strict.suffix(2)), ["--", "ytsearch5:Queen 100% Pure"], "strict search query")
-    eq(strict[strict.firstIndex(of: "--match-filter")! + 1], "duration>=190 & duration<=210", "duration window")
-    eq(strict[strict.firstIndex(of: "--max-downloads")! + 1], "1", "max one download")
-    eq(strict[strict.firstIndex(of: "-o")! + 1], "Queen - 100%% Pure.%(ext)s", "percent escaped in file name")
-    let loose = buildTrackArguments(track: t, strict: false, folder: "/t", js: nil, ffmpeg: nil)
-    eq(Array(loose.suffix(2)), ["--", "ytsearch1:Queen 100% Pure"], "loose search")
-    eq(loose.contains("--match-filter"), false, "no filter when loose")
-    let nodur = buildTrackArguments(track: Track(title: "X", artist: "", durationMs: 0), strict: true, folder: "/t", js: nil, ffmpeg: nil)
-    eq(strict[strict.firstIndex(of: "-f")! + 1], "bestaudio[ext=m4a]/bestaudio/best", "songs prefer m4a so tags can be written")
+    func args(_ src: SearchSource, _ cands: [String] = []) -> [String] { buildTrackArguments(track: t, source: src, candidates: cands, folder: "/t", js: nil, ffmpeg: nil) }
+    func filter(_ a: [String]) -> String? { a.firstIndex(of: "--match-filter").map { a[$0 + 1] } }
+    eq(Array(args(.lyric).suffix(2)), ["--", "ytsearch10:Queen 100% Pure lyrics"], "lyric search")
+    eq(filter(args(.lyric)), "duration>=190 & duration<=210 & title~=(?i)lyric & title!~=(?i)\\b(cover|karaoke|live|remix|instrumental|reaction|slowed|sped up|nightcore|8d|mashup)\\b", "lyric filter")
+    eq(Array(args(.official).suffix(2)), ["--", "ytsearch10:Queen 100% Pure official video"], "official search")
+    eq(filter(args(.official))?.hasPrefix("duration>=180 & duration<=220 & title~=(?i)official"), true, "official filter has a wider window")
+    eq(Array(args(.musicVideo).suffix(2)), ["--", "ytsearch10:Queen 100% Pure music video"], "music video search")
+    eq(filter(args(.musicVideo))?.contains("title~=(?i)official"), false, "music video tier does not need 'official'")
+    eq(Array(args(.top).suffix(2)), ["--", "ytsearch1:Queen 100% Pure"], "top result")
+    eq(filter(args(.top)), nil, "no filter for the top result")
+    eq(Array(args(.ytMusic, ["https://www.youtube.com/watch?v=aaaaaaaaaaa", "https://www.youtube.com/watch?v=bbbbbbbbbbb"]).suffix(3)),
+       ["--", "https://www.youtube.com/watch?v=aaaaaaaaaaa", "https://www.youtube.com/watch?v=bbbbbbbbbbb"], "YT Music downloads from the listed songs only")
+    eq(filter(args(.ytMusic)), "duration>=190 & duration<=210", "YT Music duration window")
+    eq(args(.top)[args(.top).firstIndex(of: "--max-downloads")! + 1], "1", "max one download")
+    eq(args(.top)[args(.top).firstIndex(of: "-o")! + 1], "Queen - 100%% Pure.%(ext)s", "percent escaped in file name")
+    eq(args(.top)[args(.top).firstIndex(of: "-f")! + 1], "bestaudio[ext=m4a]/bestaudio/best", "songs prefer m4a so tags can be written")
     eq(formatFor(audio: true, height: "720", ffmpeg: nil, audioFormat: "best"), "bestaudio/best", "best audio format")
-    eq(Array(nodur.suffix(2)), ["--", "ytsearch1:X"], "no length known uses plain search")
+    let live = Track(title: "Live and Let Die", artist: "Paul McCartney", durationMs: 190000)
+    eq(exclusionFilter(live)?.contains("live"), false, "a song called Live is not excluded for 'live'")
+    eq(exclusionFilter(live)?.contains("cover"), true, "other words still excluded")
+    let nodur = Track(title: "X", artist: "", durationMs: 0)
+    eq(filter(buildTrackArguments(track: nodur, source: .ytMusic, candidates: ["u"], folder: "/t", js: nil, ffmpeg: nil)), nil, "no length known: no length filter")
+    eq(Array(buildTrackArguments(track: nodur, source: .top, folder: "/t", js: nil, ffmpeg: nil).suffix(2)), ["--", "ytsearch1:X"], "no artist")
+    eq(ytMusicSearchURL(t), "https://music.youtube.com/search?q=Queen%20100%25%20Pure", "YT Music search address")
+    eq(percentEncodeQuery("a&b+c"), "a%26b%2Bc", "query encoding")
+    let listing = "https://music.youtube.com/watch?v=BSTsnWoslP4\nhttps://music.youtube.com/browse/UCEPMVbUzImPl4p8k4LkGevA\nhttps://music.youtube.com/browse/MPREb_9hHD965Z9xx\nhttps://music.youtube.com/watch?v=646p-BvYvpg\nhttps://music.youtube.com/watch?v=BSTsnWoslP4\nNA"
+    eq(watchLinks(fromListing: listing), ["https://www.youtube.com/watch?v=BSTsnWoslP4", "https://www.youtube.com/watch?v=646p-BvYvpg"], "only song links, no artists/albums, no repeats")
+    eq(watchLinks(fromListing: listing, limit: 1).count, 1, "limit")
+    eq(SearchSource.allCases.map { $0.label }, ["YT Music", "lyric video", "official video", "music video", "top result"], "search order")
     print("\(passed) passed, \(failed) failed")
     return failed == 0
 }

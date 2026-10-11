@@ -14,8 +14,18 @@ if let i = args.firstIndex(of: "--readtags"), args.count > i + 1 {
 if let i = args.firstIndex(of: "--download"), args.count > i + 2 {
     guard let base = findYtDlp(saved: nil) else { print("yt-dlp not found"); exit(1) }
     let mode = args.count > i + 3 ? args[i + 3] : "video"
-    let jobs = planJobs(lines: [args[i + 1]], baseFolder: args[i + 2]) { print("log: \($0)") }
-    Runner().run(base: base, jobs: jobs, audio: mode == "audio", height: "720", playlist: false,
+    var chooser: ((SpotifyList) -> [Int]?)? = nil
+    if let k = args.firstIndex(of: "--pick"), args.count > k + 1 {   // test only: --pick 1,3 pretends those songs were ticked in the picker
+        let wanted = args[k + 1].split(separator: ",").compactMap { Int($0) }.map { $0 - 1 }
+        chooser = { _ in wanted }
+    }
+    let jobs = planJobs(lines: [args[i + 1]], baseFolder: args[i + 2], log: { print("log: \($0)") }, choose: chooser)
+    let runner = Runner()
+    if let t = args.firstIndex(of: "--tiers"), args.count > t + 1 {   // test only: --tiers ytmusic,lyric,official,musicvideo,top
+        let names = ["ytmusic": SearchSource.ytMusic, "lyric": .lyric, "official": .official, "musicvideo": .musicVideo, "top": .top]
+        runner.sources = args[t + 1].split(separator: ",").compactMap { names[String($0)] }
+    }
+    runner.run(base: base, jobs: jobs, audio: mode == "audio", height: "720", playlist: false,
                  js: findJS(), ffmpeg: findFFmpeg(), audioFormat: "m4a") { print($0) }
     exit(0)
 }

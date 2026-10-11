@@ -45,7 +45,7 @@ func fetchSpotify(_ ref: SpotifyRef) -> (SpotifyList?, String) {
 }
 
 /// Turns the pasted lines into jobs: plain links stay as they are, Spotify links become one job per song.
-func planJobs(lines: [String], baseFolder: String, log: (String) -> Void) -> [Job] {
+func planJobs(lines: [String], baseFolder: String, log: (String) -> Void, choose: ((SpotifyList) -> [Int]?)? = nil) -> [Job] {
     var jobs: [Job] = []
     var plainLinks = 0
     for line in lines {
@@ -54,8 +54,12 @@ func planJobs(lines: [String], baseFolder: String, log: (String) -> Void) -> [Jo
             guard let l = list else { log("\(line)\n  \(why)"); continue }
             let folder = l.isCollection ? baseFolder + "/" + safeFileName(l.name) : baseFolder
             var tracks = l.tracks
+            if l.isCollection, tracks.count > 1, let choose = choose {   // let the user pick which songs
+                guard let picked = choose(l), !picked.isEmpty else { log("Skipped \"\(l.name)\" (no songs chosen)."); continue }
+                tracks = picked.sorted().filter { l.tracks.indices.contains($0) }.map { l.tracks[$0] }
+            }
             if tracks.count > maxTracks { log("Only the first \(maxTracks) songs of \"\(l.name)\" are used."); tracks = Array(tracks.prefix(maxTracks)) }
-            log("Spotify: \"\(l.name)\" has \(l.tracks.count) song\(l.tracks.count == 1 ? "" : "s"). Searching YouTube for each one" + (l.isCollection ? ", saving into a folder named after it." : "."))
+            log("Spotify: \"\(l.name)\" - \(tracks.count == l.tracks.count ? "\(tracks.count)" : "\(tracks.count) of \(l.tracks.count)") song\(tracks.count == 1 ? "" : "s"). Looking on YouTube Music, then lyric videos, then music videos" + (l.isCollection ? ", saving into a folder named after it." : "."))
             jobs += tracks.map { Job(label: trackLabel($0), target: .track($0), folder: folder) }
         } else if isSpotifyAddress(line) {
             log("\(line)\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; open the link in your browser and copy the song, album or playlist address.")
@@ -75,6 +79,8 @@ final class Runner {
     private let lock = NSLock()
     private var process: Process?
     private var cancelledFlag = false
+    private let debug = ProcessInfo.processInfo.environment["YTGUI_DEBUG"] != nil
+    var sources: [SearchSource] = SearchSource.allCases   // tests can limit which places are tried
 
     var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelledFlag }
 
@@ -95,7 +101,7 @@ final class Runner {
             try? FileManager.default.createDirectory(atPath: job.folder, withIntermediateDirectories: true)
             switch job.target {
             case .link(let url):
-                let r = runOne(base: base, i: i, report: report, args: buildArguments(url: url, audio: audio, height: height, folder: job.folder,
+                let r = runWithRetry(base: base, i: i, report: report, args: buildArguments(url: url, audio: audio, height: height, folder: job.folder,
                                                                                      playlist: playlist, js: js, ffmpeg: ffmpeg, audioFormat: audioFormat))
                 if cancelled {
                     report(.row(i, "Cancelled"))
@@ -108,36 +114,74 @@ final class Runner {
                     report(.log("\(url)\n  \(why)"))
                 }
             case .track(let t):
-                // Spotify songs are always saved as audio (m4a, so the tags and cover art can be written)
-                var r = runOne(base: base, i: i, report: report, args: buildTrackArguments(track: t, strict: true, folder: job.folder, js: js, ffmpeg: ffmpeg))
-                var lengthDiffers = false
-                if r.file == nil && !cancelled && t.durationMs > 0 {   // nothing within a few seconds of Spotify's length: take the top result
-                    report(.row(i, "Trying top result..."))
-                    r = runOne(base: base, i: i, report: report, args: buildTrackArguments(track: t, strict: false, folder: job.folder, js: js, ffmpeg: ffmpeg))
-                    lengthDiffers = r.file != nil
+                // Spotify songs are always saved as audio (m4a, so the tags and cover art can be written).
+                // Look in order: YouTube Music, a lyric video, an official video, any music video, the top result.
+                var found: (path: String, source: SearchSource)?
+                var lastError = ""
+                for source in sources {
+                    if cancelled { break }
+                    report(.row(i, "Looking: \(source.label)..."))
+                    var candidates: [String] = []
+                    if source == .ytMusic {
+                        candidates = watchLinks(fromListing: capture(base: base, args: ytMusicListingArguments(track: t, js: js)))
+                        if candidates.isEmpty { if debug { report(.log("debug: \(source.label): no song links in the listing")) }; continue }
+                    }
+                    let r = runWithRetry(base: base, i: i, report: report, args: buildTrackArguments(track: t, source: source, candidates: candidates,
+                                                                                              folder: job.folder, js: js, ffmpeg: ffmpeg))
+                    if let path = r.file { found = (path, source); break }
+                    if debug { report(.log("debug: \(source.label): nothing (exit \(r.code)) \(r.error)")) }
+                    if !r.error.isEmpty { lastError = r.error }
                 }
                 if cancelled {
                     report(.row(i, "Cancelled"))
-                } else if let path = r.file {
-                    var status = lengthDiffers ? "Done (length differs)" : "Done"
-                    if path.lowercased().hasSuffix(".m4a") {
+                } else if let f = found {
+                    var status = "Done (\(f.source.label))"
+                    if f.path.lowercased().hasSuffix(".m4a") {
                         report(.row(i, "Adding tags..."))
-                        if let note = tagM4A(path: path, track: enrichTrack(t)) {
-                            if status == "Done" { status = "Done (tags: see log)" }
+                        if let note = tagM4A(path: f.path, track: enrichTrack(t)) {
                             report(.log("\(job.label)\n  \(note)"))
+                            status += " - tags: see log"
                         }
                     } else {
-                        if status == "Done" { status = "Done (no tags)" }
-                        report(.log("\(job.label)\n  Saved as \((path as NSString).pathExtension), which cannot hold tags."))
+                        status += " - no tags"
+                        report(.log("\(job.label)\n  Saved as \((f.path as NSString).pathExtension), which cannot hold tags."))
                     }
                     report(.row(i, status))
                 } else {
                     report(.row(i, "Failed"))
-                    report(.log("\(job.label)\n  \(r.error.isEmpty ? "No match found on YouTube." : r.error)"))
+                    report(.log("\(job.label)\n  \(lastError.isEmpty ? "No match found on YouTube Music, lyric videos or music videos." : lastError)"))
                 }
             }
         }
         report(.finished)
+    }
+
+    /// YouTube sometimes answers a download with "403 Forbidden" for no lasting reason, so try up to 3 times.
+    private func runWithRetry(base: String, i: Int, report: @escaping (JobEvent) -> Void, args: [String]) -> (code: Int32, error: String, file: String?) {
+        var r = runOne(base: base, i: i, report: report, args: args)
+        var attempt = 1
+        while r.file == nil && r.code != 0 && !cancelled && r.error.contains("HTTP Error 403") && attempt < 3 {
+            attempt += 1
+            report(.row(i, "Retrying (\(attempt)/3)..."))
+            r = runOne(base: base, i: i, report: report, args: args)
+        }
+        return r
+    }
+
+    /// Runs yt-dlp and returns what it printed (used to list YouTube Music search results).
+    private func capture(base: String, args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: base)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        lock.lock(); process = p; lock.unlock()
+        do { try p.run() } catch { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        lock.lock(); process = nil; lock.unlock()
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func runOne(base: String, i: Int, report: @escaping (JobEvent) -> Void, args: [String]) -> (code: Int32, error: String, file: String?) {
@@ -175,4 +219,10 @@ final class Runner {
         lock.lock(); process = nil; lock.unlock()
         return (p.terminationStatus, lastError, lastFile)
     }
+}
+
+func ytMusicListingArguments(track: Track, js: (String, String)?) -> [String] {
+    var a = ["--flat-playlist", "--playlist-end", "8", "--print", "%(webpage_url)s"]
+    if let j = js { a += ["--js-runtimes", "\(j.0):\(j.1)"] }
+    return a + ["--", ytMusicSearchURL(track)]
 }
