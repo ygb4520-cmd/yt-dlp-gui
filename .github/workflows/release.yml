@@ -1,0 +1,56 @@
+name: Build and release
+
+# Push a tag like v1.0.1 and this builds the Mac app and the Windows bundle on
+# GitHub's own machines and publishes the release the in-app updater looks for.
+# "Run workflow" (manual) builds the same files but publishes nothing, as a test.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag decides the version (v1.2.3 -> 1.2.3); stamp it into the two
+      # places the app reads it from so the app and its release always agree.
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          echo "$V" > VERSION
+          sed -i '' "s/^VERSION = '.*'/VERSION = '$V'/" yt_gui.py
+          grep -q "^VERSION = '$V'" yt_gui.py
+
+      - name: Self-test (Python)
+        run: python3 -I yt_gui.py --selftest
+
+      - name: Build the Mac app
+        run: cd mac-swift && ./build.sh
+
+      - name: Self-test (Mac app)
+        run: '"mac-swift/build.noindex/yt-dlp GUI.app/Contents/MacOS/yt-dlp-gui" --selftest'
+
+      - name: Package
+        run: |
+          rm -rf dist && mkdir dist
+          ditto -c -k --keepParent "mac-swift/build.noindex/yt-dlp GUI.app" dist/yt-dlp-GUI-mac.zip
+          zip -q dist/yt-dlp-GUI-windows.zip yt_gui.py "Start yt-dlp GUI.bat" README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yt-dlp-gui
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/yt-dlp-GUI-mac.zip dist/yt-dlp-GUI-windows.zip \
+            --title "yt-dlp GUI ${GITHUB_REF_NAME#v}" --notes "yt-dlp GUI ${GITHUB_REF_NAME#v}"
