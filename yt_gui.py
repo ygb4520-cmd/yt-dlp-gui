@@ -149,7 +149,7 @@ def open_path(path, reveal=False):
 
 # ---------------------------------------------------------------- updates (same idea as the Mac app's and the Hebrew Cursive Scanner's):
 # ask GitHub for the latest release, compare it with this version, download the Windows zip, check it, swap the files.
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 UPDATE_REPO = 'ygb4520-cmd/yt-dlp-gui'
 UPDATE_FILES = ('yt_gui.py', 'Start yt-dlp GUI.bat', 'README.md')   # the only files an update may replace
 
@@ -485,7 +485,7 @@ def plan_jobs(lines, base_folder, log, choose=None):
         jobs.extend({'label': track_label(t), 'kind': 'track', 'track': t, 'folder': folder} for t in tracks)
 
     for line in lines:
-        cref = parse_catalog_line(line)
+        cref = parse_catalog_line(line) or parse_apple_music_link(line)
         sref = parse_spotify_link(line)
         if cref:
             lst, why = fetch_catalog(cref)
@@ -493,6 +493,9 @@ def plan_jobs(lines, base_folder, log, choose=None):
         elif sref:
             lst, why = fetch_spotify(*sref)
             add_list(lst, why, line, 'Spotify')
+        elif is_apple_music_address(line):
+            log('%s\n  Only Apple Music song and album links work. Playlist, artist and station links are not supported; '
+                'open the link in your browser and copy the song or album address.' % line)
         elif is_spotify_address(line):
             log('%s\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; '
                 'open the link in your browser and copy the song, album or playlist address.' % line)
@@ -517,6 +520,26 @@ CATALOG_LINE = re.compile(r'^(itunes|deezer):(song|album|playlist):(\d+)(?:\s+#.
 def parse_catalog_line(s):
     m = CATALOG_LINE.match(s)
     return (m.group(1).lower(), m.group(2).lower(), m.group(3)) if m else None
+
+
+# Apple Music links (music.apple.com/us/album/name/123?i=456, /album/name/123, /song/name/456) are looked up in Apple's catalog.
+APPLE_HOST = r'^https?://(?:embed\.)?(?:classical\.)?music\.apple\.com/'
+APPLE_PATH = re.compile(APPLE_HOST + r'(?:[a-z]{2}(?:-[a-z]{2})?/)?(album|song)/(?:[^/?#]*/)?(\d+)(?:[/?#](.*))?$', re.I)
+APPLE_SONG_PARAM = re.compile(r'(?:^|&)i=(\d+)')
+
+
+def parse_apple_music_link(s):
+    """Returns ('itunes', 'song' | 'album', id) for an Apple Music song or album link, else None."""
+    m = APPLE_PATH.match(s)
+    if not m:
+        return None
+    kind, cid, rest = m.group(1).lower(), m.group(2), m.group(3) or ''
+    sm = APPLE_SONG_PARAM.search(rest.split('#')[0].lstrip('?')) if kind == 'album' else None
+    return ('itunes', 'song', sm.group(1)) if sm else ('itunes', kind, cid)
+
+
+def is_apple_music_address(s):
+    return bool(re.match(APPLE_HOST, s, re.I))
 
 
 def new_hit(hid, title, subtitle='', detail=''):
@@ -1612,6 +1635,14 @@ def selftest():
     eq([h['id'] for h in relevant_artists([new_hit('x', 'Beyoncé')], 'beyonce')], ['x'], 'accents ignored')
     eq([h['id'] for h in relevant_artists([new_hit('h', 'ישי ריבו')], 'ישי')], ['h'], 'Hebrew words match')
     eq([h['id'] for h in relevant_artists(arts, 'mia')], ['a', 'c'], 'partial words match word starts')
+    eq(parse_apple_music_link('https://music.apple.com/us/album/abbey-road/1441164426'), ('itunes', 'album', '1441164426'), 'apple album link')
+    eq(parse_apple_music_link('https://music.apple.com/us/album/something/1441164426?i=1441164430&l=en'), ('itunes', 'song', '1441164430'), 'apple album link with ?i= is a song')
+    eq(parse_apple_music_link('https://music.apple.com/il/song/something/1441164430'), ('itunes', 'song', '1441164430'), 'apple song link')
+    eq(parse_apple_music_link('https://music.apple.com/us/album/1441164426'), ('itunes', 'album', '1441164426'), 'apple album link without a name')
+    eq(parse_apple_music_link('https://music.apple.com/us/playlist/x/pl.abc'), None, 'apple playlist not supported')
+    eq(parse_apple_music_link('https://evil.com/?u=https://music.apple.com/us/album/x/1'), None, 'must start with apple')
+    eq(is_apple_music_address('https://music.apple.com/us/artist/x/1'), True, 'apple address')
+    eq(is_apple_music_address('https://notmusic.apple.com.evil.com/x'), False, 'lookalike host')
     # catalog lines flow through the planner (with the network faked)
     real_fc = fetch_catalog
     alb = {'name': 'Abbey Road', 'collection': True, 'tracks': [new_track('A', 'B', 1000, album='Abbey Road', number=1, total=3), new_track('C', 'B', 2000, album='Abbey Road', number=2, total=3), new_track('D', 'B', 3000, album='Abbey Road', number=3, total=3)]}

@@ -23,6 +23,27 @@ func parseCatalogLine(_ s: String) -> CatalogRef? {
     return CatalogRef(source: s[a].lowercased(), kind: s[b].lowercased(), id: String(s[c]))
 }
 
+/// Apple Music links (music.apple.com/us/album/name/123?i=456, /album/name/123, /song/name/456) are looked up in Apple's catalog.
+func parseAppleMusicLink(_ s: String) -> CatalogRef? {
+    let pattern = #"^https?://(?:embed\.)?(?:classical\.)?music\.apple\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?(album|song)/(?:[^/?#]*/)?(\d+)(?:[/?#](.*))?$"#
+    guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+          let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+          let a = Range(m.range(at: 1), in: s), let b = Range(m.range(at: 2), in: s) else { return nil }
+    let kind = s[a].lowercased()
+    if kind == "album", let r = Range(m.range(at: 3), in: s) {
+        let query = String(s[r]).components(separatedBy: "#")[0].trimmingCharacters(in: CharacterSet(charactersIn: "?"))
+        if let part = query.components(separatedBy: "&").first(where: { $0.hasPrefix("i=") }) {
+            let id = String(part.dropFirst(2))
+            if !id.isEmpty, id.allSatisfy({ $0.isASCII && $0.isNumber }) { return CatalogRef(source: "itunes", kind: "song", id: id) }
+        }
+    }
+    return CatalogRef(source: "itunes", kind: kind, id: String(s[b]))
+}
+
+func isAppleMusicAddress(_ s: String) -> Bool {
+    s.range(of: #"^https?://(?:embed\.)?(?:classical\.)?music\.apple\.com/"#, options: [.regularExpression, .caseInsensitive]) != nil
+}
+
 // MARK: - polite, retrying requests (Apple's free API allows roughly 20 requests a minute)
 final class Throttle {
     private let lock = NSLock()
@@ -214,6 +235,14 @@ func catalogSelfTest(_ eq: (Any, Any, String) -> Void) {
     eq(parseCatalogLine("itunes:artist:1") == nil, true, "artist lines are only for browsing")
     eq(parseCatalogLine("https://itunes:album:1") == nil, true, "must start the line")
     eq(parseCatalogLine("itunes:album:12x") == nil, true, "id is digits only")
+    eq(parseAppleMusicLink("https://music.apple.com/us/album/abbey-road/1441164426") == CatalogRef(source: "itunes", kind: "album", id: "1441164426"), true, "apple album link")
+    eq(parseAppleMusicLink("https://music.apple.com/us/album/something/1441164426?i=1441164430&l=en") == CatalogRef(source: "itunes", kind: "song", id: "1441164430"), true, "apple album link with ?i= is a song")
+    eq(parseAppleMusicLink("https://music.apple.com/il/song/something/1441164430") == CatalogRef(source: "itunes", kind: "song", id: "1441164430"), true, "apple song link")
+    eq(parseAppleMusicLink("https://music.apple.com/us/album/1441164426") == CatalogRef(source: "itunes", kind: "album", id: "1441164426"), true, "apple album link without a name")
+    eq(parseAppleMusicLink("https://music.apple.com/us/playlist/x/pl.abc") == nil, true, "apple playlist not supported")
+    eq(parseAppleMusicLink("https://evil.com/?u=https://music.apple.com/us/album/x/1") == nil, true, "must start with apple")
+    eq(isAppleMusicAddress("https://music.apple.com/us/artist/x/1"), true, "apple address")
+    eq(isAppleMusicAddress("https://notmusic.apple.com.evil.com/x"), false, "lookalike host")
     eq(bigArt("https://x/100x100bb.jpg"), "https://x/1000x1000bb.jpg", "1000 px art")
     let song: [String: Any] = ["kind": "song", "trackId": 11, "trackName": "Chazak!", "artistName": "Avraham Fried", "collectionName": "Chazak!", "trackNumber": 1, "trackCount": 11,
                                "trackTimeMillis": 269000, "releaseDate": "2010-01-01T08:00:00Z", "artworkUrl100": "https://x/100x100bb.jpg"]

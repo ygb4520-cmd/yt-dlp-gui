@@ -64,12 +64,14 @@ func planJobs(lines: [String], baseFolder: String, log: (String) -> Void, choose
     }
 
     for line in lines {
-        if let ref = parseCatalogLine(line) {
+        if let ref = parseCatalogLine(line) ?? parseAppleMusicLink(line) {
             let (list, why) = fetchCatalog(ref)
             addList(list, why, line: line, from: ref.source == "deezer" ? "Deezer" : "Apple")
         } else if let ref = parseSpotifyLink(line) {
             let (list, why) = fetchSpotify(ref)
             addList(list, why, line: line, from: "Spotify")
+        } else if isAppleMusicAddress(line) {
+            log("\(line)\n  Only Apple Music song and album links work. Playlist, artist and station links are not supported; open the link in your browser and copy the song or album address.")
         } else if isSpotifyAddress(line) {
             log("\(line)\n  Only Spotify song, album and playlist links work. Artist, podcast and short links are not supported; open the link in your browser and copy the song, album or playlist address.")
         } else if validURL(line) {

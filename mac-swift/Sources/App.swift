@@ -169,7 +169,7 @@ final class Model: ObservableObject {
         }
         rows = []
         progress = 0
-        speedText = lines.contains(where: { parseSpotifyLink($0) != nil || parseCatalogLine($0) != nil }) ? "Looking up songs..." : ""
+        speedText = lines.contains(where: { parseSpotifyLink($0) != nil || parseCatalogLine($0) != nil || parseAppleMusicLink($0) != nil }) ? "Looking up songs..." : ""
         busy = true
         let (js, ffmpeg) = (self.js, self.ffmpeg)
         DispatchQueue.global(qos: .userInitiated).async { [runner] in
@@ -236,7 +236,7 @@ struct ContentView: View {
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.15)))
             }
             Text("Links (one per line)").font(.headline)
-            Text("Website links, a Spotify song, album or playlist link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.")
+            Text("Website links, a Spotify song, album or playlist link, an Apple Music song or album link, or press Search... to find music by name. Songs from Spotify and the search are always saved as audio (m4a) with title, artist, cover art and more written in.")
                 .font(.footnote).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top) {
                 TextEditor(text: $model.links)
