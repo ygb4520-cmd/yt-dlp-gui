@@ -11,6 +11,7 @@ import os
 import queue
 import re
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -149,7 +150,16 @@ def open_path(path, reveal=False):
 
 # ---------------------------------------------------------------- updates (same idea as the Mac app's and the Hebrew Cursive Scanner's):
 # ask GitHub for the latest release, compare it with this version, download the Windows zip, check it, swap the files.
-VERSION = '1.0.1'
+VERSION = '1.0.2'
+
+
+def ssl_context():
+    """Default TLS context, minus the strict X.509 check that newer Pythons turn on: it rejects some certificates that
+    browsers accept (for example ones missing a Subject Key Identifier). Certificates are still fully verified otherwise."""
+    ctx = ssl.create_default_context()
+    if hasattr(ssl, 'VERIFY_X509_STRICT'):
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
 UPDATE_REPO = 'ygb4520-cmd/yt-dlp-gui'
 UPDATE_FILES = ('yt_gui.py', 'Start yt-dlp GUI.bat', 'README.md')   # the only files an update may replace
 
@@ -188,7 +198,7 @@ def check_for_update():
     feed = os.environ.get('YTGUI_UPDATE_FEED') or 'https://api.github.com/repos/%s/releases/latest' % UPDATE_REPO
     try:
         req = urllib.request.Request(feed, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'yt-dlp-gui/' + VERSION})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as r:
             j = json.loads(r.read().decode('utf-8', 'replace'))
     except urllib.error.HTTPError as e:
         return None, '' if e.code == 404 else 'GitHub answered with HTTP %d' % e.code   # 404: no release published yet
@@ -211,7 +221,7 @@ def stage_update(info, progress=None):
     try:
         zpath = os.path.join(tmp, 'update.zip')
         req = urllib.request.Request(info['asset_url'], headers={'User-Agent': 'yt-dlp-gui/' + VERSION})
-        with urllib.request.urlopen(req, timeout=60) as r, open(zpath, 'wb') as out:
+        with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as r, open(zpath, 'wb') as out:
             total, got = int(r.headers.get('Content-Length') or 0), 0
             while True:
                 chunk = r.read(65536)
@@ -429,7 +439,7 @@ def http_get(url, timeout=20):
     import urllib.request
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as r:
             return r.read() if r.status == 200 else None
     except Exception:
         return None

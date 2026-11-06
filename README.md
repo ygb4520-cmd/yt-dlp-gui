@@ -30,3 +30,6 @@ open -g -n --env YTGUI_DEBUG_DRIVER="$D" "build.noindex/yt-dlp GUI.app"      # -
 printf 'mode audio\nlinks itunes:album:1441164426 # Abbey Road\ndownload\nwaitpicker\npicktoggle 0\npickok\nwaitidle\nshot\n' > "$D/command.txt"
 ```
 Commands: `links <text, \n for a new line>`, `addlink`, `mode video|audio`, `height`, `audioformat m4a|best`, `playlist on|off`, `asksongs on|off`, `folder`, `download`, `cancel`, `waitidle`, `wait <s>`, `search`, `closesearch`, `searchkind song|album|artist|playlist`, `query`, `dosearch`, `waitsearch`, `searchselect <i,j|all|none>`, `showalbums <i>`, `searchback`, `searchadd`, `waitpicker`, `pickall`, `picknone`, `picktoggle <i>`, `pickok`, `pickskip`, `size <w> <h>`, `shot`, `quit`. Use a new scratch folder per launch and `quit` (or `pkill -f "build.noindex/yt-dlp GUI.app"`) before relaunching after a rebuild.
+
+## Recent changes
+- **1.0.2** (Windows version): web requests (update check, update download, Spotify and Apple lookups) no longer fail on certificates that Python's strict X.509 check rejects but browsers accept. Certificates are still verified.
