@@ -1,0 +1,45 @@
+name: Auto-tag new versions
+
+# When a change lands on main with a version number that has no tag yet (and is newer than every existing tag), create the
+# tag and start this app's build on it. The build then publishes the GitHub Release the in-app updater looks for, exactly as
+# if the tag had been pushed by hand. Same version number as an existing tag, or an older one: nothing happens.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag a new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          echo "Version in the code: $VERSION"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "Not a plain x.y.z version; nothing to do."; exit 0; fi
+          TAG="v$VERSION"
+          git fetch --tags --quiet
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then echo "$TAG already exists; nothing to do."; exit 0; fi
+          LATEST="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            echo "$VERSION is not newer than the latest tag v$LATEST; refusing to publish an older version."; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG (automatic: new version number reached main)" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+          # Tags pushed with the built-in token do not start the tag build by themselves, but a manual start is allowed:
+          gh workflow run "release.yml" --ref "$TAG"
+          echo "Tagged $TAG and started the release build."
